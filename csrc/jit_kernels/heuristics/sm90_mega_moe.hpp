@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <format>
 #include <iostream>
 #include <string>
@@ -858,6 +859,57 @@ static bool try_apply_sm90_moe_tuning(
            try_materialize_sm90_moe_phase_tuning(input, config.l2, tuning.l2);
 }
 
+// Experiment hook: DG_SM90_MOE_TUNE="l1.bn=256,l1.epw=32,l2.st=5,..." overrides single fields
+// of the selected launch config. Keys per phase (l1./l2.): bn block_n, bk block_k, epw experts
+// per wave, st stages, ds direct L2 scatter, nm N-major schedule, cl one-warp cleanup.
+// An illegal combination is reported and ignored. Unset or empty: no effect.
+static void apply_sm90_moe_env_override(
+    const Sm90MoeHeuristicInput& input, Sm90MoeLaunchConfig& result) {
+    const char* raw = std::getenv("DG_SM90_MOE_TUNE");
+    if (raw == nullptr or *raw == 0)
+        return;
+    const std::string spec(raw);
+    auto l1 = make_sm90_moe_phase_tuning(result.l1);
+    auto l2 = make_sm90_moe_phase_tuning(result.l2);
+    size_t begin = 0;
+    while (begin < spec.size()) {
+        size_t end = spec.find(',', begin);
+        if (end == std::string::npos)
+            end = spec.size();
+        const std::string item = spec.substr(begin, end - begin);
+        begin = end + 1;
+        const size_t dot = item.find('.'), eq = item.find('=');
+        DG_HOST_ASSERT(dot != std::string::npos and eq != std::string::npos and dot < eq);
+        const std::string phase = item.substr(0, dot), key = item.substr(dot + 1, eq - dot - 1);
+        const int value = std::stoi(item.substr(eq + 1));
+        DG_HOST_ASSERT(phase == "l1" or phase == "l2");
+        auto& tuning = phase == "l1" ? l1 : l2;
+        if (key == "bn") {
+            tuning.block_n = value;
+            tuning.num_dispatch_threads = value >= 256 ? 64 : 128;
+            tuning.num_non_epilogue_threads = value >= 256 ? 64 : 128;
+            tuning.num_epilogue_threads = value >= 256 ? value : 128;
+            tuning.swap_ab = false;
+        } else if (key == "bk") tuning.block_k = value;
+        else if (key == "epw") tuning.num_experts_per_wave = value;
+        else if (key == "st") tuning.num_stages = value;
+        else if (key == "ds") tuning.direct_l2_scatter = value != 0;
+        else if (key == "nm") tuning.nmajor_schedule = value != 0;
+        else if (key == "cl") tuning.one_warp_cleanup = value != 0;
+        else DG_HOST_UNREACHABLE("unknown DG_SM90_MOE_TUNE key");
+    }
+    auto candidate = result;
+    static std::unordered_set<std::string> reported;
+    if (try_materialize_sm90_moe_phase_tuning(input, candidate.l1, l1) and
+        try_materialize_sm90_moe_phase_tuning(input, candidate.l2, l2) and
+        is_sm90_moe_launch_config_legal(input, candidate, true)) {
+        result = candidate;
+    } else if (reported.insert(spec + "@" + std::to_string(input.num_tokens)).second) {
+        std::cout << "DG_SM90_MOE_TUNE illegal, ignored: " << spec
+                  << " (num_tokens=" << input.num_tokens << ")" << std::endl;
+    }
+}
+
 static Sm90MoeLaunchConfig select_mega_moe_sm90(
     const Sm90MoeHeuristicInput& input) {
     const auto hardware_profile = classify_sm90_moe_hardware(input.launch_num_sms);
@@ -891,6 +943,7 @@ static Sm90MoeLaunchConfig select_mega_moe_sm90(
         is_sm90_moe_launch_config_legal(input, candidate, tuning.selected)) {
         result = candidate;
     }
+    apply_sm90_moe_env_override(input, result);
     if (deep_jit::get_env<int>("DG_JIT_DEBUG", 0) or deep_jit::get_env<int>("DG_PRINT_CONFIGS", 0)) {
         const auto key = std::format(
             "Sm90MoeLaunchConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
