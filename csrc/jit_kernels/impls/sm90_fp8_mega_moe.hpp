@@ -31,6 +31,8 @@ public:
         float activation_clamp;
         bool fast_math;
         bool bf16_scaled_accum;
+        bool use_situ;
+        float situ_beta, situ_linear_beta;
         KernelPhase kernel_phase;
         MegaMoESM90Config config;
 
@@ -81,7 +83,8 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {}{}
+        {},
+        {}, {}, {}{}
     >);
 }};
 )",
@@ -101,6 +104,8 @@ static void __instantiate_kernel() {{
     args.fast_math ? "true" : "false",
     args.config.swap_ab ? "true" : "false",
     args.bf16_scaled_accum ? "true" : "false",
+    args.use_situ ? "true" : "false",
+    to_string(args.situ_beta), to_string(args.situ_linear_beta),
     phase_template_args));
 
         jit->launch(kernel, args.options,
@@ -134,7 +139,10 @@ static void sm90_fp8_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& use_situ = false,
+    const float& situ_beta = 0.0f,
+    const float& situ_linear_beta = 0.0f
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -250,6 +258,8 @@ static void sm90_fp8_mega_moe(
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
         .bf16_scaled_accum = bf16_scaled_accum,
+        .use_situ = use_situ,
+        .situ_beta = situ_beta, .situ_linear_beta = situ_linear_beta,
         .kernel_phase = SM90FP8MegaMoERuntime::KernelPhase::Linear1,
         .config = l1_config,
         .y = y.data_ptr(),

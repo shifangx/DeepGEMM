@@ -379,6 +379,9 @@ class SM90SymmBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
+        assert activation in ('swiglu', 'situ'), \
+            f'Only `swiglu` and `situ` activations are supported, got `{activation}`'
+        self.activation = activation
 
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_sm90_mega_moe(
             group.size(), num_experts,
@@ -491,16 +494,27 @@ def fp8_mega_moe(y: torch.Tensor,
                  recipe: Tuple[int, int, int] = (128, 128, 128),
                  activation: str = 'swiglu',
                  activation_clamp: Optional[float] = None,
-                 fast_math: bool = True):
+                 fast_math: bool = True,
+                 situ_beta: Optional[float] = None,
+                 situ_linear_beta: Optional[float] = None):
     """SM90 (Hopper) MegaMoE entry point.
 
     Expects FP8 e4m3 weights and block-(128, 128) float scale factors. The
     weight SF layout matches the convention used by ``DeepSeekV4FlashFp8`` /
     DeepEP, so the same SF tensors can be physically shared between the
     DeepEP path and this kernel.
+
+    ``activation='situ'`` replaces SwiGLU in the L1 epilogue with
+    ``sigmoid(g) * beta * tanh(g / beta) * linear_beta * tanh(u / linear_beta)``
+    on the BF16-rounded gate ``g`` and up ``u``. It needs finite, strictly
+    positive ``situ_beta`` and ``situ_linear_beta`` and ``activation_clamp=None``.
+    Weights, scales and buffers use the same layout as SwiGLU.
     """
     if not isinstance(sym_buffer, SM90SymmBuffer):
         raise ValueError('SM90 FP8 MegaMoE requires an SM90SymmBuffer')
+    if sym_buffer.activation != activation:
+        raise ValueError(
+            f'Activation mismatch: buffer={sym_buffer.activation!r}, call={activation!r}')
     _C.fp8_mega_moe(
         y,
         l1_weights, l2_weights,
@@ -511,5 +525,5 @@ def fp8_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
-        fast_math
+        fast_math, situ_beta, situ_linear_beta
     )

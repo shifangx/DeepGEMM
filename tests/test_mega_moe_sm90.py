@@ -16,6 +16,8 @@ Layers
   L5  Stress          : ``--num-correctness-tests`` repeated random configs.
   L6  Stateful        : optional uneven/empty ranks, exact cumulative stats,
                         live/masked/live buffer reuse and changed-input graph replay.
+  L7  SiTU            : optional; the SiTU activation across heuristic bands, the
+                        M2 Flash routed shape, heavy masking and ``fast_math`` 0/1.
 
 Notes
 -----
@@ -104,6 +106,17 @@ def _swiglu_fp32(gate_up: torch.Tensor, clamp: float) -> torch.Tensor:
     return torch.nn.functional.silu(gate) * up
 
 
+def _situ_fp32(gate_up: torch.Tensor, beta: float, linear_beta: float) -> torch.Tensor:
+    """SiTU on the BF16-rounded gate/up halves, matching the fused kernel:
+    ``sigmoid(g) * beta * tanh(g / beta) * linear_beta * tanh(u / linear_beta)``.
+    """
+    half = gate_up.size(-1) // 2
+    gate = gate_up[..., :half].to(torch.bfloat16).float()
+    up = gate_up[..., half:].to(torch.bfloat16).float()
+    return (torch.sigmoid(gate) * beta * torch.tanh(gate / beta) *
+            linear_beta * torch.tanh(up / linear_beta))
+
+
 def _reference_fused(
     x_fp8_local: torch.Tensor, x_sf_local: torch.Tensor,
     topk_idx_local: torch.Tensor, topk_weights_local: torch.Tensor,
@@ -113,6 +126,8 @@ def _reference_fused(
     num_experts: int, num_topk: int,
     hidden: int, intermediate_hidden: int,
     activation_clamp: float,
+    activation: str = 'swiglu',
+    situ_beta: float = None, situ_linear_beta: float = None,
 ) -> torch.Tensor:
     """Reference: returns (num_tokens, hidden) bf16 result for *this* rank.
 
@@ -188,7 +203,11 @@ def _reference_fused(
             del l1_w_sel
 
             # SwiGLU + clamp + multiply by topk weight
-            l1_y = _swiglu_fp32(l1_y, activation_clamp) * weights.unsqueeze(-1)   # (S, IH)
+            if activation == 'situ':
+                l1_y = _situ_fp32(l1_y, situ_beta, situ_linear_beta)
+            else:
+                l1_y = _swiglu_fp32(l1_y, activation_clamp)
+            l1_y = l1_y * weights.unsqueeze(-1)                    # (S, IH)
 
             # Per-row, per-64-col FP8 quantize -> dequantize
             s_, ih = l1_y.shape
@@ -234,6 +253,12 @@ def _run_scenario(
     masked_ratio = cfg.get('masked_ratio', 0.0)
     activation_clamp = cfg.get('activation_clamp', 10.0)
     fast_math = cfg.get('fast_math', True)
+    activation = cfg.get('activation', 'swiglu')
+    situ_beta = cfg.get('situ_beta')
+    situ_linear_beta = cfg.get('situ_linear_beta')
+    if activation == 'situ':
+        # SiTU saturates through tanh and rejects an explicit clamp.
+        activation_clamp = math.inf
 
     assert num_experts % num_ranks == 0, f'{name}: experts {num_experts} not divisible by ranks {num_ranks}'
     num_experts_per_rank = num_experts // num_ranks
@@ -284,6 +309,7 @@ def _run_scenario(
         group, num_experts,
         num_max, num_topk,
         hidden, intermediate_hidden,
+        activation=activation,
     )
     cum_stats = torch.zeros(num_experts_per_rank, dtype=torch.int, device='cuda')
 
@@ -300,9 +326,10 @@ def _run_scenario(
         y_fused, transformed_l1, transformed_l2, buffer,
         cumulative_local_expert_recv_stats=cum_stats,
         recipe=(128, 128, 128),
-        activation='swiglu',
+        activation=activation,
         activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
         fast_math=fast_math,
+        situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
     )
     _trace('sync_sm90')
     torch.cuda.synchronize()
@@ -320,6 +347,7 @@ def _run_scenario(
         num_experts, num_topk,
         hidden, intermediate_hidden,
         activation_clamp,
+        activation, situ_beta, situ_linear_beta,
     )
 
     diff = calc_diff(y_fused, y_ref)
@@ -515,6 +543,38 @@ def test_sm90_mega_moe_host_guards():
                 (0, 0, 0), 'swiglu', 10.0, True)
 
 
+def _layer7_situ(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
+    """SiTU activation. Inputs are scaled so gate/up reach the tanh saturation region."""
+    situ = dict(activation='situ', situ_beta=10.0, situ_linear_beta=10.0)
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    out.append(('L7.situ.smoke', dict(_SMOKE, **situ)))
+    base = dict(hidden=1024, intermediate_hidden=1024,
+                num_experts=8 * num_ranks, num_topk=2, **situ)
+    for tokens in (64, 512, 2048):
+        cfg = dict(base)
+        cfg.update(num_max_tokens_per_rank=tokens, num_tokens=tokens)
+        out.append((f'L7.situ.heur.t{tokens}', cfg))
+    # Small betas put most activations on the saturated branch.
+    cfg = dict(base, situ_beta=1.0, situ_linear_beta=0.5)
+    cfg.update(num_max_tokens_per_rank=128, num_tokens=128)
+    out.append(('L7.situ.small_beta', cfg))
+    cfg = dict(base, fast_math=False)
+    cfg.update(num_max_tokens_per_rank=128, num_tokens=128)
+    out.append(('L7.situ.fm0', cfg))
+    # M2 Flash routed experts: latent 1536, intermediate 1536, 64 experts per rank, top-12.
+    flash = dict(hidden=1536, intermediate_hidden=1536,
+                 num_experts=64 * num_ranks, num_topk=12, **situ)
+    for tokens in (8, 128, 1024):
+        cfg = dict(flash)
+        cfg.update(num_max_tokens_per_rank=max(tokens, 128), num_tokens=tokens)
+        out.append((f'L7.situ.m2_flash.t{tokens}', cfg))
+    # Heavy masking: 7 of 8 routes are skipped.
+    cfg = dict(flash, masked_ratio=0.875)
+    cfg.update(num_max_tokens_per_rank=256, num_tokens=256)
+    out.append(('L7.situ.m2_flash.mask0.875', cfg))
+    return out
+
+
 def _layer6_stateful(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
     counts = [0, 1, 7, 31, 32, 63, 64, 127]
     return [
@@ -678,6 +738,8 @@ def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace
         layers += _layer5_stress(num_ranks, args.num_correctness_tests or 8)
     if 6 in args.layers:
         layers += _layer6_stateful(num_ranks)
+    if 7 in args.layers:
+        layers += _layer7_situ(num_ranks)
 
     if args.filter:
         layers = [(n, c) for n, c in layers if args.filter in n]
@@ -715,9 +777,10 @@ if __name__ == '__main__':
     parser.add_argument('--num-processes', type=int, default=2,
                         help='Number of ranks to spawn (default: 2)')
     parser.add_argument('--layers', type=int, nargs='+', default=[1, 2, 3, 4],
-                        help='Which layers to run (1..6). Default: 1 2 3 4. '
+                        help='Which layers to run (1..7). Default: 1 2 3 4. '
                              'Layer 5 runs 8 random cases unless overridden; '
-                             'optional layer 6 checks uneven stateful reuse and CUDA graphs.')
+                             'optional layer 6 checks uneven stateful reuse and CUDA graphs; '
+                             'optional layer 7 checks the SiTU activation.')
     parser.add_argument('--num-correctness-tests', type=int, default=None,
                         help='Layer 5 stress test count')
     parser.add_argument('--filter', type=str, default='',

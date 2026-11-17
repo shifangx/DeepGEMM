@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <cmath>
 #include <limits>
 #include <optional>
 #include <string>
@@ -32,8 +33,9 @@ get_symm_buffer_size_for_sm90_mega_moe(
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     if (not use_fp8_dispatch)
         DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE currently supports FP8 dispatch only");
-    if (activation != "swiglu")
-        DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE currently supports the swiglu activation only");
+    // SwiGLU and SiTU share one buffer layout: the activation only changes the L1 epilogue math.
+    if (activation != "swiglu" and activation != "situ")
+        DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE supports the swiglu and situ activations only");
     DG_HOST_ASSERT(num_max_tokens_per_rank > 0 and
                    num_max_tokens_per_rank % kSM90MegaMoETokenAlignment == 0);
     if (hidden <= 0 or hidden % 256 != 0)
@@ -160,7 +162,9 @@ static void fp8_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const std::optional<float>& situ_beta_opt,
+    const std::optional<float>& situ_linear_beta_opt
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -194,13 +198,24 @@ static void fp8_mega_moe(
     const auto [rm, rn, rk] = recipe;
     if (rm != 128 or rn != 128 or rk != 128)
         DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE requires recipe=(128, 128, 128)");
-    if (activation != "swiglu")
-        DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE currently supports the swiglu activation only");
+    if (activation != "swiglu" and activation != "situ")
+        DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE supports the swiglu and situ activations only");
 
     // Activation checks
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
+    // SiTU saturates through tanh, so it takes finite positive betas and no clamp (the same
+    // contract as the SM100 `fp8_fp4_mega_moe` SiTU path). SwiGLU takes neither beta.
+    const auto use_situ = activation == "situ";
+    const auto situ_beta = situ_beta_opt.value_or(0.0f);
+    const auto situ_linear_beta = situ_linear_beta_opt.value_or(0.0f);
+    DG_HOST_ASSERT(not use_situ or not activation_clamp_opt.has_value());
+    DG_HOST_ASSERT(not use_situ or
+                   (std::isfinite(situ_beta) and situ_beta > 0 and
+                    std::isfinite(situ_linear_beta) and situ_linear_beta > 0));
+    DG_HOST_ASSERT(use_situ or
+                   (not situ_beta_opt.has_value() and not situ_linear_beta_opt.has_value()));
 
     // Tensor checks: SM90 weights must be FP8 e4m3, K-major
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
@@ -266,15 +281,41 @@ static void fp8_mega_moe(
                      num_experts_per_rank,
                      num_tokens, num_topk,
                      hidden, intermediate_hidden,
-                     activation_clamp, fast_math);
+                     activation_clamp, fast_math,
+                     use_situ, situ_beta, situ_linear_beta);
 
     if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG", 0))
         sym_buffer.zero_();
 }
 
+// SwiGLU-only signature kept for callers that predate SiTU.
+static void fp8_mega_moe_swiglu(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math
+) {
+    fp8_mega_moe(y, l1_weights_tuple, l2_weights_tuple,
+                 cumulative_local_expert_recv_stats,
+                 sym_buffer, sym_buffer_ptrs, rank_idx,
+                 num_max_tokens_per_rank, num_experts, num_topk,
+                 recipe, activation, activation_clamp_opt, fast_math,
+                 std::nullopt, std::nullopt);
+}
+
 static void register_sm90_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_sm90_mega_moe", &get_token_alignment_for_sm90_mega_moe);
     m.def("get_symm_buffer_size_for_sm90_mega_moe", &get_symm_buffer_size_for_sm90_mega_moe);
+    // Two overloads: the original 14-argument call and the one carrying the SiTU betas.
+    m.def("fp8_mega_moe", &fp8_mega_moe_swiglu);
     m.def("fp8_mega_moe", &fp8_mega_moe);
 }
 

@@ -35,7 +35,7 @@ namespace deep_gemm {
 //   * One A+SFA producer warp and one B producer warp feed the pipeline.
 //   * Math warpgroups consume each
 //     stage with WGMMA, accumulate into registers, then run the epilogue:
-//       - L1 (Linear1): SwiGLU with gate/up granularity-8 interleaved layout,
+//       - L1 (Linear1): SwiGLU or SiTU with gate/up granularity-8 interleaved layout,
 //         per-row amax over the 64 post-SwiGLU columns of this block, FP8 e4m3
 //         quantize, STSM into SMEM, TMA store to local L1 output buffer.
 //         The per-row SF is written as a *float* into the L2-acts SF buffer at
@@ -109,7 +109,10 @@ struct MegaMoEPhasePolicy {
     float kActivationClamp, \
     bool kFastMath, \
     bool kFP8SwapAB = false, \
-    bool kBF16ScaledAccumRequested = false
+    bool kBF16ScaledAccumRequested = false, \
+    bool kUseSiTU = false, \
+    float kSiTUBeta = 0.0f, \
+    float kSiTULinearBeta = 0.0f
 
 #define DG_SM90_FP8_MOE_KERNEL_ARGS_DECL \
     void* y, \
@@ -152,7 +155,28 @@ struct MegaMoEPhasePolicy {
     kNumExpertsPerWave, BLOCK_M, BLOCK_N, BLOCK_K, kNumMaxPoolTokens, \
     kNumPaddedSFPoolTokens, kSFPoolStrideTokens, kNumStages, kNumDispatchThreads, \
     kNumNonEpilogueThreads, kNumEpilogueThreads, kNumSMs, kNumRanks, \
-    kActivationClamp, kFastMath, kFP8SwapAB, kBF16ScaledAccumRequested
+    kActivationClamp, kFastMath, kFP8SwapAB, kBF16ScaledAccumRequested, \
+    kUseSiTU, kSiTUBeta, kSiTULinearBeta
+
+// L1 gated activation on the FP32 gate/up accumulators.
+//   SwiGLU: silu(gate) * up.
+//   SiTU:   sigmoid(g) * beta * tanh(g / beta) * linear_beta * tanh(u / linear_beta), with
+//           g/u first rounded to BF16 (the same contract as the SM100 SiTU epilogue).
+template <bool kFastMath, bool kUseSiTU, float kSiTUBeta, float kSiTULinearBeta>
+__forceinline__ __device__ float sm90_fp8_mega_moe_gated_activation(float gate, float up) {
+    if constexpr (kUseSiTU) {
+        gate = __bfloat162float(__float2bfloat16_rn(gate));
+        up = __bfloat162float(__float2bfloat16_rn(up));
+        const float e = kFastMath ? __expf(-gate) : expf(-gate);
+        const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
+        return sig * (kSiTUBeta * tanhf(gate / kSiTUBeta)) *
+               (kSiTULinearBeta * tanhf(up / kSiTULinearBeta));
+    } else {
+        const float e = kFastMath ? __expf(-gate) : expf(-gate);
+        const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
+        return gate * sig * up;
+    }
+}
 
 template <typename MegaMoEPhase, DG_SM90_FP8_MOE_TEMPLATE_PARAMS>
 CUTLASS_DEVICE void
@@ -190,6 +214,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                      "BLOCK_K must comprise whole BK128 TMA tiles");
     DG_STATIC_ASSERT(BLOCK_N <= 512,
                      "BLOCK_N exceeds the two-box TMA staging contract");
+    DG_STATIC_ASSERT(not kUseSiTU or
+                     (kSiTUBeta > 0 and kSiTUBeta < cute::numeric_limits<float>::infinity() and
+                      kSiTULinearBeta > 0 and kSiTULinearBeta < cute::numeric_limits<float>::infinity()),
+                     "Invalid SiTU beta");
+    DG_STATIC_ASSERT(not kUseSiTU or kActivationClamp == cute::numeric_limits<float>::infinity(),
+                     "SiTU cannot clamp");
 
     // Thread / warp identification
     const uint32_t sm_idx     = blockIdx.x;
@@ -1685,10 +1715,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
             if (is_linear1_phase) {
                 if constexpr (kSwapABActive) {
-                    auto silu = [](float x) -> float {
-                        const float e = kFastMath ? __expf(-x) : expf(-x);
-                        const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
-                        return x * sig;
+                    auto gated = [](const float& g, const float& u) -> float {
+                        return sm90_fp8_mega_moe_gated_activation<
+                            kFastMath, kUseSiTU, kSiTUBeta, kSiTULinearBeta>(g, u);
                     };
                     auto clamp_gate = [](float& x) {
                         if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity())
@@ -1712,7 +1741,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 .get_data_buffer(m_idx + token_0)
                                 .template get_base_ptr<float>();
                             smem_cd_swap_l1_fp32[token_0 * L1_OUT_BLOCK_N + out_col_base] =
-                                silu(g0) * u0 * weight_0;
+                                gated(g0, u0) * weight_0;
                         }
                         if (token_1 < valid_m) {
                             float g1 = final_accum[i * 4 + 1];
@@ -1723,7 +1752,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 .get_data_buffer(m_idx + token_1)
                                 .template get_base_ptr<float>();
                             smem_cd_swap_l1_fp32[token_1 * L1_OUT_BLOCK_N + out_col_base] =
-                                silu(g1) * u1 * weight_1;
+                                gated(g1, u1) * weight_1;
                         }
                     };
 
@@ -1827,15 +1856,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         float u_r1_c0 = final_accum[up*4   + 2]; clamp_up(u_r1_c0);
                         float u_r1_c1 = final_accum[up*4   + 3]; clamp_up(u_r1_c1);
 
-                        auto silu = [](float x) {
-                            const float e = kFastMath ? __expf(-x) : expf(-x);
-                            const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
-                            return x * sig;
+                        auto gated = [](const float& g, const float& u) -> float {
+                            return sm90_fp8_mega_moe_gated_activation<
+                                kFastMath, kUseSiTU, kSiTUBeta, kSiTULinearBeta>(g, u);
                         };
 
                         if (valid_r0) {
-                            swiglu_r0[p][0] = silu(g_r0_c0) * u_r0_c0;
-                            swiglu_r0[p][1] = silu(g_r0_c1) * u_r0_c1;
+                            swiglu_r0[p][0] = gated(g_r0_c0, u_r0_c0);
+                            swiglu_r0[p][1] = gated(g_r0_c1, u_r0_c1);
                             amax_r0[sf_group] = cute::max(
                                 amax_r0[sf_group],
                                 cute::max(cute::abs(swiglu_r0[p][0]), cute::abs(swiglu_r0[p][1])));
@@ -1844,8 +1872,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             swiglu_r0[p][1] = 0.0f;
                         }
                         if (valid_r1) {
-                            swiglu_r1[p][0] = silu(g_r1_c0) * u_r1_c0;
-                            swiglu_r1[p][1] = silu(g_r1_c1) * u_r1_c1;
+                            swiglu_r1[p][0] = gated(g_r1_c0, u_r1_c0);
+                            swiglu_r1[p][1] = gated(g_r1_c1, u_r1_c1);
                             amax_r1[sf_group] = cute::max(
                                 amax_r1[sf_group],
                                 cute::max(cute::abs(swiglu_r1[p][0]), cute::abs(swiglu_r1[p][1])));
