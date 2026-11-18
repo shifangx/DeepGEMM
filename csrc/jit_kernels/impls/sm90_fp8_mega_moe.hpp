@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstdlib>
 #include <string>
 #include <format>
@@ -65,12 +66,27 @@ public:
                         args.config.direct_l2_scatter ? "true" : "false",
                         args.config.nmajor_schedule ? "true" : "false",
                         args.config.one_warp_cleanup ? "true" : "false");
-        // Experiment switch, see sm90_fp8_mega_moe_gated_activation. Part of the generated
-        // source, hence of the JIT cache key.
-        const char* fast_tanh_env = std::getenv("DG_SM90_SITU_FAST_TANH");
-        const std::string fast_tanh_define =
-            (fast_tanh_env != nullptr and std::string(fast_tanh_env) == "1")
-                ? "#define DG_SM90_SITU_FAST_TANH 1" : "";
+        // Experiment switches for the SiTU tanh of the L1 epilogue (see
+        // sm90_fp8_mega_moe_gated_activation). They are part of the generated source or of the
+        // compiler options, hence of the JIT cache key. Unset: libm tanhf, as before.
+        //   DG_SM90_SITU_TANH=exp (or DG_SM90_SITU_FAST_TANH=1): tanh from the fast exp
+        //   DG_SM90_SITU_TANH=lut: 257-entry table with linear interpolation
+        //   DG_SM90_MOE_USE_FAST_MATH=1: compile the L1 kernel with nvcc --use_fast_math
+        const auto env_is = [](const char* name, const char* value) {
+            const char* raw = std::getenv(name);
+            return raw != nullptr and std::string(raw) == value;
+        };
+        std::string fast_tanh_define;
+        if (env_is("DG_SM90_SITU_TANH", "exp") or env_is("DG_SM90_SITU_FAST_TANH", "1")) {
+            fast_tanh_define = "#define DG_SM90_SITU_FAST_TANH 1";
+        } else if (env_is("DG_SM90_SITU_TANH", "lut")) {
+            fast_tanh_define = "#define DG_SM90_SITU_TANH_LUT 1\n#define DG_SM90_SITU_TANH_LUT_VALUES ";
+            for (int i = 0; i <= 256; ++ i)
+                fast_tanh_define += std::format("{}{:.9e}f", i == 0 ? "" : ", ", std::tanh(i / 32.0));
+        }
+        deep_jit::cuda::CompilerOptions compiler_options;
+        if (args.kernel_phase == KernelPhase::Linear1 and env_is("DG_SM90_MOE_USE_FAST_MATH", "1"))
+            compiler_options.fast_math = true;
         const auto kernel = jit->compile(tag, std::format(R"(
 {}
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
@@ -116,7 +132,7 @@ static void __instantiate_kernel() {{
     args.bf16_scaled_accum ? "true" : "false",
     args.use_situ ? "true" : "false",
     to_string(args.situ_beta), to_string(args.situ_linear_beta),
-    phase_template_args));
+    phase_template_args), compiler_options);
 
         jit->launch(kernel, args.options,
             args.y,

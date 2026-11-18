@@ -162,6 +162,18 @@ struct MegaMoEPhasePolicy {
 //   SwiGLU: silu(gate) * up.
 //   SiTU:   sigmoid(g) * beta * tanh(g / beta) * linear_beta * tanh(u / linear_beta), with
 //           g/u first rounded to BF16 (the same contract as the SM100 SiTU epilogue).
+#ifdef DG_SM90_SITU_TANH_LUT
+// Experiment: tanh by a 257-entry table over |x| in [0, 8] (step 1/32) with linear
+// interpolation and odd symmetry. The values are generated on the host at JIT time.
+__forceinline__ __device__ float sm90_fp8_mega_moe_tanh_lut(const float x) {
+    static const float kTable[257] = { DG_SM90_SITU_TANH_LUT_VALUES };
+    const float position = cute::min(fabsf(x) * 32.0f, 255.996f);
+    const int index = static_cast<int>(position);
+    const float fraction = position - static_cast<float>(index);
+    return copysignf(kTable[index] + fraction * (kTable[index + 1] - kTable[index]), x);
+}
+#endif
+
 template <bool kFastMath, bool kUseSiTU, float kSiTUBeta, float kSiTULinearBeta>
 __forceinline__ __device__ float sm90_fp8_mega_moe_gated_activation(float gate, float up) {
     if constexpr (kUseSiTU) {
@@ -178,6 +190,9 @@ __forceinline__ __device__ float sm90_fp8_mega_moe_gated_activation(float gate, 
         const float eu = __expf(cute::min(cute::max(up * (-2.0f / kSiTULinearBeta), -30.0f), 30.0f));
         return sig * (kSiTUBeta * (1.0f - eg) * math::fast_rcp(1.0f + eg)) *
                (kSiTULinearBeta * (1.0f - eu) * math::fast_rcp(1.0f + eu));
+#elif defined(DG_SM90_SITU_TANH_LUT)
+        return sig * (kSiTUBeta * sm90_fp8_mega_moe_tanh_lut(gate * (1.0f / kSiTUBeta))) *
+               (kSiTULinearBeta * sm90_fp8_mega_moe_tanh_lut(up * (1.0f / kSiTULinearBeta)));
 #else
         return sig * (kSiTUBeta * tanhf(gate / kSiTUBeta)) *
                (kSiTULinearBeta * tanhf(up / kSiTULinearBeta));
