@@ -169,8 +169,19 @@ __forceinline__ __device__ float sm90_fp8_mega_moe_gated_activation(float gate, 
         up = __bfloat162float(__float2bfloat16_rn(up));
         const float e = kFastMath ? __expf(-gate) : expf(-gate);
         const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
+#ifdef DG_SM90_SITU_FAST_TANH
+        // Experiment (opt-in at JIT time through the environment variable of the same name):
+        // tanh(x) = (1 - e^{-2x}) / (1 + e^{-2x}) with the fast exp and reciprocal already
+        // used for the sigmoid, instead of two libm tanhf calls per output element. The
+        // exponent is clamped so that the quotient stays finite where tanh has saturated.
+        const float eg = __expf(cute::min(cute::max(gate * (-2.0f / kSiTUBeta), -30.0f), 30.0f));
+        const float eu = __expf(cute::min(cute::max(up * (-2.0f / kSiTULinearBeta), -30.0f), 30.0f));
+        return sig * (kSiTUBeta * (1.0f - eg) * math::fast_rcp(1.0f + eg)) *
+               (kSiTULinearBeta * (1.0f - eu) * math::fast_rcp(1.0f + eu));
+#else
         return sig * (kSiTUBeta * tanhf(gate / kSiTUBeta)) *
                (kSiTULinearBeta * tanhf(up / kSiTULinearBeta));
+#endif
     } else {
         const float e = kFastMath ? __expf(-gate) : expf(-gate);
         const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);

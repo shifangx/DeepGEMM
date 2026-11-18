@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdlib>
+#include <string>
 #include <format>
 #include <torch/python.h>
 #include "../../runtime/runtime.hpp"
@@ -63,7 +65,14 @@ public:
                         args.config.direct_l2_scatter ? "true" : "false",
                         args.config.nmajor_schedule ? "true" : "false",
                         args.config.one_warp_cleanup ? "true" : "false");
+        // Experiment switch, see sm90_fp8_mega_moe_gated_activation. Part of the generated
+        // source, hence of the JIT cache key.
+        const char* fast_tanh_env = std::getenv("DG_SM90_SITU_FAST_TANH");
+        const std::string fast_tanh_define =
+            (fast_tanh_env != nullptr and std::string(fast_tanh_env) == "1")
+                ? "#define DG_SM90_SITU_FAST_TANH 1" : "";
         const auto kernel = jit->compile(tag, std::format(R"(
+{}
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -88,6 +97,7 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+    fast_tanh_define,
     kernel_symbol,
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
