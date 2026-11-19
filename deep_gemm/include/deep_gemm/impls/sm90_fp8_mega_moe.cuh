@@ -1729,6 +1729,17 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 run_default_gemm_loop();
             }
 
+#ifdef DG_SM90_LADDER_SKIP_EPILOGUE
+            // opt02 ladder rung (timing only): drop the epilogue of the selected phase.
+            if constexpr ((DG_SM90_LADDER_SKIP_EPILOGUE & (MegaMoEPhase::runs_linear1 ? 1 : 2)) != 0) {
+                if constexpr (MegaMoEPhase::runs_linear1 and kWarpgroupSplitM > 1 and not kSplitNWarpgroups) {
+                    ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                } else {
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                }
+                return;
+            }
+#endif
             // Skip epilogue when block is past valid M (still must release via empty).
             if (row_block_offset >= valid_m) {
                 if constexpr (MegaMoEPhase::runs_linear1 and kWarpgroupSplitM > 1 and not kSplitNWarpgroups) {

@@ -84,6 +84,10 @@ public:
             for (int i = 0; i <= 256; ++ i)
                 fast_tanh_define += std::format("{}{:.9e}f", i == 0 ? "" : ", ", std::tanh(i / 32.0));
         }
+        // opt02 ladder rung (timing only, the output is wrong): DG_SM90_LADDER_SKIP_EPILOGUE=1 skips the
+        // L1 epilogue, 2 skips the L2 epilogue, 3 both; the GEMM main loop and the dispatch stay.
+        if (const char* ladder = std::getenv("DG_SM90_LADDER_SKIP_EPILOGUE"))
+            fast_tanh_define += std::format("\n#define DG_SM90_LADDER_SKIP_EPILOGUE {}", std::atoi(ladder));
         deep_jit::cuda::CompilerOptions compiler_options;
         if (args.kernel_phase == KernelPhase::Linear1 and env_is("DG_SM90_MOE_USE_FAST_MATH", "1"))
             compiler_options.fast_math = true;
