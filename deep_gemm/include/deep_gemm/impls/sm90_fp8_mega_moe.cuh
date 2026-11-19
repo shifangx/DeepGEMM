@@ -30,6 +30,10 @@
 // opt02 ladder (timing only, the output is wrong): DG_SM90_LADDER is a mask of roles to drop.
 //   0x001 L1 epilogue      0x002 L2 epilogue (scatter)   0x004 L1 WGMMA        0x008 L2 WGMMA
 //   0x010 dispatch pull    0x020 combine                 0x040 L1 TMA loads    0x080 L2 TMA loads
+//   0x100 pool ready: the dispatch warps stop after the index exchange (no per-token loop at all) and the L1
+//         loaders do not wait for the pool, i.e. only the dispatch preamble is left of the dispatch role
+//   0x200 L2 scatter without its global stores (BF16 cast, SMEM staging and barriers stay)
+//   0x400 L1 epilogue without its TMA store and scale-factor stores (activation, quantization, SMEM stay)
 // The control flow, barriers and cross-rank synchronisation stay in every case.
 #ifndef DG_SM90_LADDER
 #define DG_SM90_LADDER 0
@@ -279,6 +283,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr bool kLadderSkipPull     = (kLadder & 0x10u) != 0;
     constexpr bool kLadderSkipCombine  = (kLadder & 0x20u) != 0;
     constexpr bool kLadderSkipLoads    = (kLadder & (MegaMoEPhase::runs_linear1 ? 0x40u : 0x80u)) != 0;
+    constexpr bool kLadderPoolReady    = (kLadder & 0x100u) != 0;
+    constexpr bool kLadderNoScatterStores = (kLadder & 0x200u) != 0;
+    constexpr bool kLadderNoL1Stores   = (kLadder & 0x400u) != 0;
 
     // Thread / warp identification
     const uint32_t sm_idx     = blockIdx.x;
@@ -736,6 +743,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         const auto pull_mbarrier = dispatch_barriers[warp_idx];
 
         scheduler.fetch_expert_recv_count();
+        if constexpr (kLadderPoolReady)
+            return;
 
         constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
         int      current_expert_idx = -1;
@@ -1007,7 +1016,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
             // Wait for the pool to be ready. Cluster peers can be dummy CTAs for
             // the tail M unit when an expert has an odd number of M blocks.
-            if (has_valid_m) {
+            if (has_valid_m and not kLadderPoolReady) {
                 if (is_linear1_phase) {
                     const auto ptr = workspace.get_l1_full_count_ptr(pool_block_idx);
                     const auto expected = valid_m;
@@ -2264,7 +2273,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     }
 
                     // Write L2-activation SF as float, one value per 64 output columns.
-                    if (col_idx == 0) {
+                    if (col_idx == 0 and not kLadderNoL1Stores) {
                         auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
                         const uint32_t token_r0 = pool_block_idx * BLOCK_M + row_offset_r0;
                         const uint32_t token_r1 = pool_block_idx * BLOCK_M + row_offset_r1;
@@ -2289,7 +2298,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     // win for low-batch / decode where every tile is partial.
                     if constexpr (kSplitNWarpgroups) {
                         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                        if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                        if (epilogue_warp_idx == 0 and not kLadderNoL1Stores and cute::elect_one_sync()) {
                             const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
                             cute::tma_store_fence();
                             cute::SM90_TMA_STORE_2D::copy(
@@ -2456,7 +2465,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         constexpr uint32_t kRowBytes = BLOCK_N * kCombineElementBytes;
                         DG_STATIC_ASSERT(kRowBytes % 16 == 0 and (kHidden * kCombineElementBytes) % 16 == 0,
                                          "Bulk scatter rows must be 16-byte aligned");
-                        if (epilogue_thread_idx < valid_m) {
+                        if (epilogue_thread_idx < valid_m and not kLadderNoScatterStores) {
                             const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + epilogue_thread_idx);
                             const auto dst_token = combine_token_buffer.get_rank_buffer(src_metadata.topk_idx)
                                                    .get_data_buffer(src_metadata.token_idx);
@@ -2486,7 +2495,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
                         const uint32_t row_in_wg = warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
                         const uint32_t m_idx_in_block = row_block_offset + row_in_wg;
-                        if (m_idx_in_block >= valid_m) break;
+                        if (m_idx_in_block >= valid_m or kLadderNoScatterStores) break;
 
                         const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
                         const uint32_t dst_rank_idx = src_metadata.rank_idx;
