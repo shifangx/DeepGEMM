@@ -27,6 +27,14 @@
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
+// opt02 ladder (timing only, the output is wrong): DG_SM90_LADDER is a mask of roles to drop.
+//   0x001 L1 epilogue      0x002 L2 epilogue (scatter)   0x004 L1 WGMMA        0x008 L2 WGMMA
+//   0x010 dispatch pull    0x020 combine                 0x040 L1 TMA loads    0x080 L2 TMA loads
+// The control flow, barriers and cross-rank synchronisation stay in every case.
+#ifndef DG_SM90_LADDER
+#define DG_SM90_LADDER 0
+#endif
+
 namespace deep_gemm {
 
 // Pipeline (cluster=1, no TMA multicast):
@@ -246,6 +254,13 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                      "Invalid SiTU beta");
     DG_STATIC_ASSERT(not kUseSiTU or kActivationClamp == cute::numeric_limits<float>::infinity(),
                      "SiTU cannot clamp");
+
+    constexpr uint32_t kLadder = DG_SM90_LADDER;
+    constexpr bool kLadderSkipEpilogue = (kLadder & (MegaMoEPhase::runs_linear1 ? 0x1u : 0x2u)) != 0;
+    constexpr bool kLadderSkipMMA      = (kLadder & (MegaMoEPhase::runs_linear1 ? 0x4u : 0x8u)) != 0;
+    constexpr bool kLadderSkipPull     = (kLadder & 0x10u) != 0;
+    constexpr bool kLadderSkipCombine  = (kLadder & 0x20u) != 0;
+    constexpr bool kLadderSkipLoads    = (kLadder & (MegaMoEPhase::runs_linear1 ? 0x40u : 0x80u)) != 0;
 
     // Thread / warp identification
     const uint32_t sm_idx     = blockIdx.x;
@@ -767,7 +782,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             const uint32_t src_topk_idx  = src_token_topk_idx % kNumTopk;
 
             // TMA pull token data into SMEM
-            if (cute::elect_one_sync()) {
+            if (not kLadderSkipPull and cute::elect_one_sync()) {
                 ptx::tma_load_1d(
                     pull_buffer.get_base_ptr(),
                     sym_buffer.map(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
@@ -787,30 +802,34 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             #pragma unroll
             for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFFloats, 32u); ++ i) {
                 const uint32_t j = i * 32 + lane_idx;
-                if (j < kNumSFFloats)
+                if (j < kNumSFFloats and not kLadderSkipPull)
                     local_sf_ptr[j * kSFPoolStrideTokens + sf_pool_token_idx] = remote_sf_ptr[j];
             }
             __syncwarp();
 
             const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
             if (cute::elect_one_sync()) {
-                const auto weight = *sym_buffer.map(
-                    input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                    current_rank_in_expert_idx);
-                *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
+                if constexpr (not kLadderSkipPull) {
+                    const auto weight = *sym_buffer.map(
+                        input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
+                        current_rank_in_expert_idx);
+                    *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
 
-                ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
-                ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
+                    ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
+                    ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
 
-                ptx::tma_store_1d(
-                    l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr(),
-                    pull_buffer.get_base_ptr(), pull_buffer.get_num_bytes());
+                    ptx::tma_store_1d(
+                        l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr(),
+                        pull_buffer.get_base_ptr(), pull_buffer.get_num_bytes());
+                }
 
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
 
-                cute::tma_store_arrive();
-                ptx::tma_store_wait<0>();
+                if constexpr (not kLadderSkipPull) {
+                    cute::tma_store_arrive();
+                    ptx::tma_store_wait<0>();
+                }
                 ptx::red_add_rel(
                     workspace.get_l1_full_count_ptr(expert_pool_block_offset + token_idx_in_expert / BLOCK_M), 1);
             }
@@ -851,7 +870,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);
 
                 if (cute::elect_one_sync()) {
-                    if (has_valid_m) {
+                    if (has_valid_m and not kLadderSkipLoads) {
                     const uint32_t m_idx = pool_block_idx * BLOCK_M;
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
 
@@ -922,7 +941,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);
 
-                if (cute::elect_one_sync()) {
+                if (kLadderSkipLoads) {
+                    if (cute::elect_one_sync())
+                        full_barriers[stage_idx]->arrive();
+                } else if (cute::elect_one_sync()) {
                     const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
 
@@ -1721,7 +1743,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 }
             };
 
-            if constexpr (BLOCK_K == 256) {
+            if constexpr (kLadderSkipMMA) {
+                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                    full_barriers[stage_idx]->wait(phase);
+                    arrive_empty_barrier(stage_idx);
+                }
+            } else if constexpr (BLOCK_K == 256) {
                 run_bk256_gemm_loop();
             } else if constexpr (kBF16ScaledAccum and not kSwapABActive) {
                 run_bf16_scaled_accum_gemm_loop();
@@ -1729,9 +1756,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 run_default_gemm_loop();
             }
 
-#ifdef DG_SM90_LADDER_SKIP_EPILOGUE
-            // opt02 ladder rung (timing only): drop the epilogue of the selected phase.
-            if constexpr ((DG_SM90_LADDER_SKIP_EPILOGUE & (MegaMoEPhase::runs_linear1 ? 1 : 2)) != 0) {
+            // opt02 ladder rung (timing only): drop the epilogue of this phase.
+            if constexpr (kLadderSkipEpilogue) {
                 if constexpr (MegaMoEPhase::runs_linear1 and kWarpgroupSplitM > 1 and not kSplitNWarpgroups) {
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
                 } else {
@@ -1739,7 +1765,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 }
                 return;
             }
-#endif
             // Skip epilogue when block is past valid M (still must release via empty).
             if (row_block_offset >= valid_m) {
                 if constexpr (MegaMoEPhase::runs_linear1 and kWarpgroupSplitM > 1 and not kSplitNWarpgroups) {
@@ -2253,6 +2278,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         // Sync with dispatch (paired with dispatch's pre-cleanup sync) so that
         // dispatch may now safely clean workspace state.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+
+        if constexpr (kLadderSkipCombine)
+            return;
 
         constexpr uint32_t kNumChunks = kCombineNumChunks;
         constexpr uint32_t kInputChunkBytes = kCombineInputChunkBytes;
