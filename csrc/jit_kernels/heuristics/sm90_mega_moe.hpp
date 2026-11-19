@@ -861,7 +861,7 @@ static bool try_apply_sm90_moe_tuning(
 
 // Experiment hook: DG_SM90_MOE_TUNE="l1.bn=256,l1.epw=32,l2.st=5,..." overrides single fields
 // of the selected launch config. Keys per phase (l1./l2.): bn block_n, bk block_k, epw experts
-// per wave, st stages, ds direct L2 scatter, nm N-major schedule, cl one-warp cleanup.
+// per wave, bm block_m (opt02), st stages, ds direct L2 scatter, nm N-major schedule, cl one-warp cleanup.
 // An illegal combination is reported and ignored. Unset or empty: no effect.
 static void apply_sm90_moe_env_override(
     const Sm90MoeHeuristicInput& input, Sm90MoeLaunchConfig& result) {
@@ -890,7 +890,8 @@ static void apply_sm90_moe_env_override(
             tuning.num_non_epilogue_threads = value >= 256 ? 64 : 128;
             tuning.num_epilogue_threads = value >= 256 ? value : 128;
             tuning.swap_ab = false;
-        } else if (key == "bk") tuning.block_k = value;
+        } else if (key == "bm") tuning.block_m = value;  // opt02: 128 uses two 64-row math warpgroups
+        else if (key == "bk") tuning.block_k = value;
         else if (key == "epw") tuning.num_experts_per_wave = value;
         else if (key == "st") tuning.num_stages = value;
         else if (key == "ds") tuning.direct_l2_scatter = value != 0;
@@ -898,6 +899,9 @@ static void apply_sm90_moe_env_override(
         else if (key == "cl") tuning.one_warp_cleanup = value != 0;
         else DG_HOST_UNREACHABLE("unknown DG_SM90_MOE_TUNE key");
     }
+    for (auto* tuning : {&l1, &l2})
+        if (tuning->block_m == 128)
+            tuning->num_epilogue_threads = std::max(tuning->num_epilogue_threads, 256);
     auto candidate = result;
     static std::unordered_set<std::string> reported;
     if (try_materialize_sm90_moe_phase_tuning(input, candidate.l1, l1) and
