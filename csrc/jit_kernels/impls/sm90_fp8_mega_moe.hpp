@@ -101,6 +101,9 @@ public:
                 fast_tanh_define += std::format("\n#define DG_SM90_MOE_OPT {}", opt);
         if (const int depth = get_sm90_moe_dispatch_depth(); depth > 0)
             fast_tanh_define += std::format("\n#define DG_SM90_MOE_DISPATCH_DEPTH {}", depth);
+        // opt02 in-kernel timestamps (see the top of sm90_fp8_mega_moe.cuh).
+        if (env_is("DG_SM90_STAMPS", "1"))
+            fast_tanh_define += "\n#define DG_SM90_STAMPS 1";
         deep_jit::cuda::CompilerOptions compiler_options;
         if (args.kernel_phase == KernelPhase::Linear1 and env_is("DG_SM90_MOE_USE_FAST_MATH", "1"))
             compiler_options.fast_math = true;

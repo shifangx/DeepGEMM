@@ -41,6 +41,26 @@
 #define DG_SM90_LADDER 0
 #endif
 
+// opt02 in-kernel timestamps (DG_SM90_STAMPS=1 at JIT time; off by default). One thread per role in every CTA
+// splits its time into consecutive segments with clock64() and adds the per-segment cycle counts, at the end of
+// its role, to 64-bit counters behind `cumulative_local_expert_recv_stats` (which then must point to at least
+// 128 uint64; the expert statistics are not written). Counters are sums over CTAs and over kernel runs.
+// Layout: 64 counters per kernel (L1 at 0, L2 at 64); within a kernel
+//   [ 0..15] math warpgroup 0, [16..31] math warpgroup 1 (first thread of each):
+//        0 between tiles (scheduler, tile setup)   1 waiting for a loaded stage     2 scale reads + WGMMA issue + wait
+//        3 promotion (scale-and-add)               4 epilogue part 1 (L1: activation, quantization, SMEM, scale-factor
+//          stores; L2: BF16 cast + SMEM)           5 barrier after part 1           6 epilogue part 2 (L1: TMA store and
+//          its wait; L2: scatter loop)             7 final barrier of the tile (L2; also the skipped-tile path)
+//        8 cross-rank barrier before combine (L2)  9 combine (L2)                  10 tiles (a count, not cycles)
+//       11 role duration by %globaltimer (ns)     12 before the first tile (wait for the dispatch warps)
+//   [32..39] TMA warp A (+ scale factors): 0 issuing / bookkeeping, 1 waiting for a free stage, 2 waiting for the pool
+//   [40..47] TMA warp B (weights):         0 issuing / bookkeeping, 1 waiting for a free stage
+//   [48..55] dispatch warp 0 (L1 only):    0 index exchange up to the pull loop, 1 pull loop
+//   [56]     CTAs that reported (a count)
+#ifndef DG_SM90_STAMPS
+#define DG_SM90_STAMPS 0
+#endif
+
 // opt02 optimizations, opt-in at JIT time through DG_SM90_MOE_OPT (a mask; 0 = the unchanged kernel).
 //   0x1 bulk L2 scatter: the L2 epilogue stages the BF16 tile row-major in SMEM and sends every row to its
 //       combine slot with one asynchronous bulk copy (cp.async.bulk), instead of 16-byte stores per lane
@@ -324,6 +344,54 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx   = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx   = ptx::get_lane_idx();
+
+    // opt02 timestamps (see the top of this file). `stamp(slot)` books the time since the previous stamp to `slot`.
+    constexpr bool kStamps = (DG_SM90_STAMPS) != 0;
+    const auto stamp_out = reinterpret_cast<unsigned long long*>(cumulative_local_expert_recv_stats) +
+        (MegaMoEPhase::runs_linear2 ? 64 : 0);
+    unsigned long long st_last = 0, st[13] = {};
+    bool stamper = false;
+    uint32_t st_base = 0;
+    const auto stamp_begin = [&](const bool is_stamper, const uint32_t base) {
+        if constexpr (kStamps) {
+            stamper = is_stamper;
+            st_base = base;
+            if (stamper)
+                st_last = static_cast<unsigned long long>(clock64());
+        }
+    };
+    const auto stamp = [&](const uint32_t slot) {
+        if constexpr (kStamps) {
+            if (stamper) {
+                const auto now = static_cast<unsigned long long>(clock64());
+                st[slot] += now - st_last;
+                st_last = now;
+            }
+        }
+    };
+    const auto stamp_count = [&](const uint32_t slot) {
+        if constexpr (kStamps) {
+            if (stamper)
+                st[slot] += 1;
+        }
+    };
+    const auto stamp_globaltimer = [&]() {
+        unsigned long long t = 0;
+        if constexpr (kStamps)
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        return t;
+    };
+    const auto stamp_flush = [&](const uint32_t num_slots) {
+        if constexpr (kStamps) {
+            if (stamper) {
+                #pragma unroll
+                for (uint32_t i = 0; i < 13; ++ i) {
+                    if (i < num_slots)
+                        atomicAdd(stamp_out + st_base + i, st[i]);
+                }
+            }
+        }
+    };
 
     // Prefetch the TMA descriptors used by this split phase.
     if (warp_idx == 0 and cute::elect_one_sync()) {
@@ -648,7 +716,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     if (warp_idx == 0) {
                         if (lane_idx == 0) {
                             *workspace.get_expert_recv_count_sum_ptr(i) = 0;
-                            if (cumulative_local_expert_recv_stats != nullptr)
+                            if (not kStamps and cumulative_local_expert_recv_stats != nullptr)
                                 ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
                         }
                     }
@@ -656,7 +724,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     if (warp_idx == 0) {
                         *workspace.get_expert_recv_count_sum_ptr(i) = 0;
                     } else if (warp_idx == 1) {
-                        if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
+                        if (cute::elect_one_sync() and not kStamps and cumulative_local_expert_recv_stats != nullptr)
                             ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
                         __syncwarp();
                     }
@@ -704,6 +772,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             return;
         }
 
+        stamp_begin(warp_idx == 0 and lane_idx == 0, 48);
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
         constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
         const auto read_topk_idx = [&](const auto& process) {
@@ -779,6 +848,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         // Sync with epilogue warps before pulling tokens
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
+        stamp(0);
         // Token / SF pull loop
         uint32_t pull_mbarrier_phase = 0;
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
@@ -1035,6 +1105,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             __syncwarp();
         }
 
+        stamp(1);
+        stamp_flush(2);
         return;
 
     // ROLE 2: GEMM TMA load warps (A+SFA and B)
@@ -1042,6 +1114,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     // configurations keep the remaining two warps idle for register handoff.
     } else if (warp_idx == kNumDispatchWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        stamp_begin(lane_idx == 0, 32);
 
         for_each_selected_block([&](const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1055,6 +1128,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
             const uint32_t valid_m = scheduler.template get_valid_m<false>();
             const bool has_valid_m = valid_m > 0;
+            stamp(0);
 
             // Wait for the pool to be ready. Cluster peers can be dummy CTAs for
             // the tail M unit when an expert has an odd number of M blocks.
@@ -1065,8 +1139,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     while (ptx::ld_acq(ptr) != expected);
                 }
             }
+            stamp(2);
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);
+                stamp(1);
 
                 if (cute::elect_one_sync()) {
                     if (has_valid_m and not kLadderSkipLoads) {
@@ -1122,11 +1198,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     }
                 }
                 __syncwarp();
+                stamp(0);
             }
         });
+        stamp(0);
+        stamp_flush(3);
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        stamp_begin(lane_idx == 0, 40);
 
         for_each_selected_block([&](const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1138,7 +1218,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             const uint32_t shape_n = !is_linear1_phase ? L2_SHAPE_N : L1_SHAPE_N;
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                stamp(0);
                 empty_barriers[stage_idx]->wait(phase ^ 1);
+                stamp(1);
 
                 if (kLadderSkipLoads) {
                     if (cute::elect_one_sync())
@@ -1170,6 +1252,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 __syncwarp();
             }
         });
+        stamp(0);
+        stamp_flush(2);
 
     } else if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Idle non-epilogue warps (kNumDispatchWarps+2, +3). They must still
@@ -1206,8 +1290,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             DG_STATIC_ASSERT(WG_BLOCK_M == L1WGMMA::M, "Each warpgroup must run exactly one WGMMA per K-block");
         }
 
+        stamp_begin(lane_idx == 0 and warp_idx_in_wg == 0 and epilogue_wg_idx < 2, epilogue_wg_idx * 16);
+        const auto stamp_role_start = stamp_globaltimer();
         // Sync with dispatch
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        stamp(12);
 
         for_each_selected_block([&](const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1228,6 +1315,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             const uint32_t row_offset_r1 = row_block_offset + r_1;
             const bool valid_r0 = row_offset_r0 < valid_m;
             const bool valid_r1 = row_offset_r1 < valid_m;
+            stamp(0);
+            stamp_count(10);
             // GEMM
             using WGMMA = L1WGMMA;
             constexpr uint32_t kAccumPerThread = WGMMA::kNumAccum * kNumWGMMAsPerTile;
@@ -1259,6 +1348,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 float gate_sf = 0.0f, up_sf = 0.0f;
                 float l2_sf_lo = 0.0f, l2_sf_hi = 0.0f;
                 full_barriers[stage_idx]->wait(phase);
+                stamp(1);
 
                 // Read SF (must precede warpgroup_arrive)
                 float scale_a_0_lo, scale_a_1_lo;
@@ -1406,6 +1496,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         ptx::warpgroup_wait<0>();
 
                         arrive_empty_barrier(stage_idx);
+                        stamp(2);
 
                         // L1: gate/up alternate at gran=8 along N; each `i` block of 8
                         // cols belongs entirely to one of {gate, up}, so .x and .y
@@ -1424,6 +1515,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             final_accum[i*4+2] += scale_a_1_lo * sb * accum[i*4+2];
                             final_accum[i*4+3] += scale_a_1_lo * sb * accum[i*4+3];
                         }
+                        stamp(3);
                     }
                 } else {
                     if constexpr (kSwapABActive) {
@@ -1554,6 +1646,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(accum[i]);
                     ptx::warpgroup_wait<0>();
+                    stamp(2);
 
                     // L2 weight SF is per 128 output columns; M64N256 spans two SF groups.
                     #pragma unroll
@@ -1570,6 +1663,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         final_accum[i*4+2] += scale_a_1_lo * l2_sf * accum[i*4+2];
                         final_accum[i*4+3] += scale_a_1_lo * l2_sf * accum[i*4+3];
                     }
+                    stamp(3);
 
                     // Second half: K=64..127, SFA = scale_a_*_hi
                     #pragma unroll
@@ -1590,6 +1684,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     ptx::warpgroup_wait<0>();
 
                     arrive_empty_barrier(stage_idx);
+                    stamp(2);
 
                     // L2 second half: same SFA half, still choose weight SF by N chunk.
                     #pragma unroll
@@ -1606,6 +1701,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         final_accum[i*4+2] += scale_a_1_hi * l2_sf * accum[i*4+2];
                         final_accum[i*4+3] += scale_a_1_hi * l2_sf * accum[i*4+3];
                     }
+                    stamp(3);
                     }
                 }
                 }
@@ -2172,6 +2268,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 } else {
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 }
+                stamp(7);
                 return;
             }
 
@@ -2454,7 +2551,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     // STSM'd into smem). Using TMA for partial tiles is a large
                     // win for low-batch / decode where every tile is partial.
                     if constexpr (kSplitNWarpgroups) {
+                        stamp(4);
                         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                        stamp(5);
                         if (epilogue_warp_idx == 0 and not kLadderNoL1Stores and cute::elect_one_sync()) {
                             const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
                             cute::tma_store_fence();
@@ -2467,6 +2566,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         }
                         __syncwarp();
                         ptx::tma_store_wait<0>();
+                        stamp(6);
                     } else {
                         ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
                         if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
@@ -2640,7 +2740,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         }
                         return;
                     }
+                    stamp(4);
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                    stamp(5);
 
                     // Scatter to remote ranks via NVLink (one row per warp-pair)
                     // Each warpgroup-warp covers 8 unique rows × 2 (r_0 + r_1 doubled by warps)
@@ -2695,12 +2797,23 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         }
                     }
 
+                    stamp(6);
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    stamp(7);
                 }
             }
         });
+        stamp(0);
 
         if constexpr (!MegaMoEPhase::runs_linear2) {
+            if constexpr (kStamps) {
+                if (stamper) {
+                    st[11] = stamp_globaltimer() - stamp_role_start;
+                    if (epilogue_wg_idx == 0)
+                        atomicAdd(stamp_out + 56, 1ull);
+                }
+            }
+            stamp_flush(13);
             return;
         }
         // Bulk scatter: all rows must have left this CTA before the cross-rank barrier says so.
@@ -2720,6 +2833,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         // Sync with dispatch (paired with dispatch's pre-cleanup sync) so that
         // dispatch may now safely clean workspace state.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        stamp(8);
 
         if constexpr (kLadderSkipCombine)
             return;
@@ -2844,6 +2958,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 __syncwarp();
             }
         }
+        stamp(9);
+        if constexpr (kStamps) {
+            if (stamper) {
+                st[11] = stamp_globaltimer() - stamp_role_start;
+                if (epilogue_wg_idx == 0)
+                    atomicAdd(stamp_out + 56, 1ull);
+            }
+        }
+        stamp_flush(13);
     }
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
