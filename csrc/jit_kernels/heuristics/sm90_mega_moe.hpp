@@ -890,7 +890,10 @@ static void apply_sm90_moe_env_override(
             tuning.num_non_epilogue_threads = value >= 256 ? 64 : 128;
             tuning.num_epilogue_threads = value >= 256 ? value : 128;
             tuning.swap_ab = false;
-        } else if (key == "bm") tuning.block_m = value;  // opt02: 128 uses two 64-row math warpgroups
+        } else if (key == "bm") {  // opt02: 128 uses two 64-row math warpgroups; stages are re-derived
+            tuning.block_m = value;
+            tuning.num_stages = 0;
+        }
         else if (key == "bk") tuning.block_k = value;
         else if (key == "epw") tuning.num_experts_per_wave = value;
         else if (key == "st") tuning.num_stages = value;
