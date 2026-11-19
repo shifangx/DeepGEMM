@@ -93,6 +93,10 @@
 //   0x100 hoisted L1 top-k weights: the two per-row routing weights a math thread multiplies into the L1 output
 //        are read after the tile's first stage has arrived (the pool block is complete then) instead of in the
 //        epilogue. Same values.
+//   0x200 prefetched scatter metadata: at the start of an L2 tile one thread issues one bulk copy of the tile's
+//        source metadata (BLOCK_M records) into SMEM (the dispatch scratch area, unused in the L2 kernel until
+//        combine); it completes while the GEMM runs, and the scatter loop reads the records from SMEM instead of
+//        doing a dependent global read per row pair. Same bytes, same values.
 #ifndef DG_SM90_MOE_OPT
 #define DG_SM90_MOE_OPT 0
 #endif
@@ -484,6 +488,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr bool kBulkL2Scatter =
         ((DG_SM90_MOE_OPT) & 0x1u) != 0 and MegaMoEPhase::runs_linear2 and
         not kSwapABActive and not kDirectL2Scatter;
+    constexpr bool kPrefetchScatterMeta =
+        ((DG_SM90_MOE_OPT) & 0x200u) != 0 and ((DG_SM90_MOE_OPT) & 0x80u) == 0 and MegaMoEPhase::runs_linear2 and
+        not kSwapABActive and not kDirectL2Scatter and not kBulkL2Scatter;
     constexpr bool kHoistScatterMeta =
         ((DG_SM90_MOE_OPT) & 0x80u) != 0 and MegaMoEPhase::runs_linear2 and
         not kSwapABActive and not kDirectL2Scatter and not kBulkL2Scatter;
@@ -1304,6 +1311,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             DG_STATIC_ASSERT(WG_BLOCK_M == L1WGMMA::M, "Each warpgroup must run exactly one WGMMA per K-block");
         }
 
+        // opt02 prefetched scatter metadata: SMEM copy of the current tile's records and the parity of its barrier.
+        constexpr uint32_t kScatterMetaBytes = BLOCK_M * sizeof(layout::nv_moe::TokenSrcMetadata);
+        const auto scatter_meta_smem = math::advance_ptr<uint8_t>(smem_buffer, SMEM_EXPERT_COUNT_SIZE);
+        uint32_t scatter_meta_phase = 0;
+        if constexpr (kPrefetchScatterMeta) {
+            DG_STATIC_ASSERT(kScatterMetaBytes % 16 == 0 and kScatterMetaBytes <= SMEM_SEND_BUFFER_SIZE,
+                             "The scatter metadata of a tile must fit the dispatch scratch area");
+        }
         stamp_begin(lane_idx == 0 and warp_idx_in_wg == 0 and epilogue_wg_idx < 2, epilogue_wg_idx * 16);
         const auto stamp_role_start = stamp_globaltimer();
         // Sync with dispatch
@@ -1330,8 +1345,21 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             const bool valid_r0 = row_offset_r0 < valid_m;
             const bool valid_r1 = row_offset_r1 < valid_m;
             // opt02 hoisted scatter metadata: destination pointer of this lane's 16-column slice of row `row_in_wg`.
+            if constexpr (kPrefetchScatterMeta) {
+                if (valid_m > 0) {
+                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                        ptx::tma_load_1d(scatter_meta_smem, workspace.get_token_src_metadata_ptr(m_idx),
+                                         dispatch_barriers[0], kScatterMetaBytes);
+                        ptx::mbarrier_arrive_and_set_tx(dispatch_barriers[0], kScatterMetaBytes);
+                    }
+                    __syncwarp();
+                }
+            }
             const auto scatter_dst_of = [&](const uint32_t row_in_wg) {
-                const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + row_block_offset + row_in_wg);
+                const auto src_metadata = kPrefetchScatterMeta ?
+                    *(reinterpret_cast<const layout::nv_moe::TokenSrcMetadata*>(scatter_meta_smem) +
+                      row_block_offset + row_in_wg) :
+                    *workspace.get_token_src_metadata_ptr(m_idx + row_block_offset + row_in_wg);
                 const auto dst_token = combine_token_buffer.get_rank_buffer(src_metadata.topk_idx)
                                        .get_data_buffer(src_metadata.token_idx);
                 auto dst_ptr = math::advance_ptr<uint8_t>(
@@ -2792,6 +2820,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     stamp(4);
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
                     stamp(5);
+                    if constexpr (kPrefetchScatterMeta) {
+                        dispatch_barriers[0]->wait(scatter_meta_phase);
+                        scatter_meta_phase ^= 1;
+                    }
 
                     // Scatter to remote ranks via NVLink (one row per warp-pair)
                     // Each warpgroup-warp covers 8 unique rows × 2 (r_0 + r_1 doubled by warps)
