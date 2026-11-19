@@ -525,9 +525,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
     // Register allocations keep each launch within the 64K CTA budget. The
     // four-warpgroup split-N path uses smaller front-end allocations.
-    constexpr uint32_t kNumDispatchRegisters    = kNumEpilogueThreads == 512 ? 32 : 48;
+    // opt02: eight dispatch warps (256 threads) take the small front-end allocations as well.
+    constexpr bool kSmallFrontendRegisters = kNumEpilogueThreads == 512 or kNumDispatchThreads >= 256;
+    constexpr uint32_t kNumDispatchRegisters    = kSmallFrontendRegisters ? 32 : 48;
     constexpr bool kCompactFrontendWarpgroup = (kNumDispatchWarps == 2 and kNumMMANonEpilogueWarps == 2);
-    constexpr uint32_t kNumNonEpilogueRegisters = kNumEpilogueThreads == 512 ? 24 :
+    constexpr uint32_t kNumNonEpilogueRegisters = kSmallFrontendRegisters ? 24 :
         (kCompactFrontendWarpgroup ? kNumDispatchRegisters : 40);
     constexpr uint32_t kNumEpilogueRegisters    =
         kNumEpilogueThreads == 512 ? 112 : 208;

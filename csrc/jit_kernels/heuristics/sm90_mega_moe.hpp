@@ -861,7 +861,7 @@ static bool try_apply_sm90_moe_tuning(
 
 // Experiment hook: DG_SM90_MOE_TUNE="l1.bn=256,l1.epw=32,l2.st=5,..." overrides single fields
 // of the selected launch config. Keys per phase (l1./l2.): bn block_n, bk block_k, epw experts
-// per wave, bm block_m (opt02), st stages, ds direct L2 scatter, nm N-major schedule, cl one-warp cleanup.
+// per wave, bm block_m (opt02), dt dispatch threads (opt02, after bn), nt TMA-warp threads (opt02), st stages, ds direct L2 scatter, nm N-major schedule, cl one-warp cleanup.
 // An illegal combination is reported and ignored. Unset or empty: no effect.
 static void apply_sm90_moe_env_override(
     const Sm90MoeHeuristicInput& input, Sm90MoeLaunchConfig& result) {
@@ -894,6 +894,8 @@ static void apply_sm90_moe_env_override(
             tuning.block_m = value;
             tuning.num_stages = 0;
         }
+        else if (key == "dt") tuning.num_dispatch_threads = value;       // opt02: dispatch threads (64, 128, 256)
+        else if (key == "nt") tuning.num_non_epilogue_threads = value;   // opt02: TMA-warp threads (64, 128)
         else if (key == "bk") tuning.block_k = value;
         else if (key == "epw") tuning.num_experts_per_wave = value;
         else if (key == "st") tuning.num_stages = value;
