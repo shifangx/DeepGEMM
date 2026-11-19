@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cstdlib>
-
 #include <cmath>
 #include <functional>
 #include <string>
@@ -259,10 +257,7 @@ static void fp8_fp4_mega_moe(
     // Check stats counter
     if (cumulative_local_expert_recv_stats.has_value()) {
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
-        // opt02: with DG_SM90_STAMPS=1 the tensor receives the in-kernel timestamp counters (128 uint64 = 256 int32).
-        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank or
-                       (std::getenv("DG_SM90_STAMPS") != nullptr and
-                        cumulative_local_expert_recv_stats->numel() >= 256));
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
     }
 
@@ -376,10 +371,7 @@ static void bf16_mega_moe(
     // Check stats counter
     if (cumulative_local_expert_recv_stats.has_value()) {
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
-        // opt02: with DG_SM90_STAMPS=1 the tensor receives the in-kernel timestamp counters (128 uint64 = 256 int32).
-        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank or
-                       (std::getenv("DG_SM90_STAMPS") != nullptr and
-                        cumulative_local_expert_recv_stats->numel() >= 256));
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
     }
 
