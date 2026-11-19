@@ -53,6 +53,8 @@
 //          its wait; L2: scatter loop)             7 final barrier of the tile (L2; also the skipped-tile path)
 //        8 cross-rank barrier before combine (L2)  9 combine (L2)                  10 tiles (a count, not cycles)
 //       11 role duration by %globaltimer (ns)     12 before the first tile (wait for the dispatch warps)
+//       L1 only, epilogue part 1 in pieces: 4 activation; 13 top-k weight, amax reduction, scale factors;
+//       14 quantization + SMEM; 15 scale-factor stores
 //   [32..39] TMA warp A (+ scale factors): 0 issuing / bookkeeping, 1 waiting for a free stage, 2 waiting for the pool
 //   [40..47] TMA warp B (weights):         0 issuing / bookkeeping, 1 waiting for a free stage
 //   [48..55] dispatch warp 0 (L1 only):    0 index exchange up to the pull loop, 1 pull loop
@@ -85,6 +87,12 @@
 //        weight scale * WGMMA accumulator, 64 FMAs per thread per K block in L1 and per K half in L2) is done
 //        while the next WGMMA is running, by alternating between two accumulator register sets, instead of
 //        between two WGMMAs. Same operations in the same order: bitwise identical.
+//   0x80 hoisted scatter metadata: every math thread reads the source metadata of the 8 rows it will scatter, and
+//        forms their destination pointers, at the start of the L2 tile (the reads return while the GEMM runs)
+//        instead of one dependent read per row pair inside the scatter loop. Same bytes, same values.
+//   0x100 hoisted L1 top-k weights: the two per-row routing weights a math thread multiplies into the L1 output
+//        are read after the tile's first stage has arrived (the pool block is complete then) instead of in the
+//        epilogue. Same values.
 #ifndef DG_SM90_MOE_OPT
 #define DG_SM90_MOE_OPT 0
 #endif
@@ -349,7 +357,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr bool kStamps = (DG_SM90_STAMPS) != 0;
     const auto stamp_out = reinterpret_cast<unsigned long long*>(cumulative_local_expert_recv_stats) +
         (MegaMoEPhase::runs_linear2 ? 64 : 0);
-    unsigned long long st_last = 0, st[13] = {};
+    unsigned long long st_last = 0, st[16] = {};
     bool stamper = false;
     uint32_t st_base = 0;
     const auto stamp_begin = [&](const bool is_stamper, const uint32_t base) {
@@ -385,7 +393,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         if constexpr (kStamps) {
             if (stamper) {
                 #pragma unroll
-                for (uint32_t i = 0; i < 13; ++ i) {
+                for (uint32_t i = 0; i < 16; ++ i) {
                     if (i < num_slots)
                         atomicAdd(stamp_out + st_base + i, st[i]);
                 }
@@ -476,6 +484,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr bool kBulkL2Scatter =
         ((DG_SM90_MOE_OPT) & 0x1u) != 0 and MegaMoEPhase::runs_linear2 and
         not kSwapABActive and not kDirectL2Scatter;
+    constexpr bool kHoistScatterMeta =
+        ((DG_SM90_MOE_OPT) & 0x80u) != 0 and MegaMoEPhase::runs_linear2 and
+        not kSwapABActive and not kDirectL2Scatter and not kBulkL2Scatter;
+    constexpr bool kHoistL1Weights =
+        ((DG_SM90_MOE_OPT) & 0x100u) != 0 and MegaMoEPhase::runs_linear1 and not kSwapABActive and
+        BLOCK_K == 128 and not kBF16ScaledAccumRequested and not kSplitWGMMAN and not kOverlapPromotion;
     constexpr bool kSplitWGMMAN =
         ((DG_SM90_MOE_OPT) & 0x4u) != 0 and not kSplitNWarpgroups and WG_BLOCK_N == 256 and
         BLOCK_K == 128 and not kBF16ScaledAccumRequested and not kSwapABActive;
@@ -1315,6 +1329,27 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             const uint32_t row_offset_r1 = row_block_offset + r_1;
             const bool valid_r0 = row_offset_r0 < valid_m;
             const bool valid_r1 = row_offset_r1 < valid_m;
+            // opt02 hoisted scatter metadata: destination pointer of this lane's 16-column slice of row `row_in_wg`.
+            const auto scatter_dst_of = [&](const uint32_t row_in_wg) {
+                const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + row_block_offset + row_in_wg);
+                const auto dst_token = combine_token_buffer.get_rank_buffer(src_metadata.topk_idx)
+                                       .get_data_buffer(src_metadata.token_idx);
+                auto dst_ptr = math::advance_ptr<uint8_t>(
+                    dst_token.get_base_ptr(),
+                    n_idx * kCombineElementBytes +
+                        (lane_idx % 16) * ((WG_BLOCK_N / 16) * kCombineElementBytes));
+                return sym_buffer.map(dst_ptr, src_metadata.rank_idx);
+            };
+            decltype(scatter_dst_of(0u)) scatter_dst[WG_BLOCK_M / 8] = {};
+            if constexpr (kHoistScatterMeta) {
+                #pragma unroll
+                for (uint32_t j = 0; j < WG_BLOCK_M / 8; ++ j) {
+                    const uint32_t row_in_wg = warp_idx_in_wg * 16 + j * 2 + lane_idx / 16;
+                    if (row_block_offset + row_in_wg < valid_m)
+                        scatter_dst[j] = scatter_dst_of(row_in_wg);
+                }
+            }
+            float hoisted_weight_r0 = 0.0f, hoisted_weight_r1 = 0.0f;
             stamp(0);
             stamp_count(10);
             // GEMM
@@ -1349,6 +1384,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 float l2_sf_lo = 0.0f, l2_sf_hi = 0.0f;
                 full_barriers[stage_idx]->wait(phase);
                 stamp(1);
+                if constexpr (kHoistL1Weights) {
+                    if (k_block_idx == 0) {
+                        hoisted_weight_r0 = valid_r0 ? *l1_topk_weights_buffer
+                            .get_data_buffer(m_idx + row_offset_r0).template get_base_ptr<float>() : 0.0f;
+                        hoisted_weight_r1 = valid_r1 ? *l1_topk_weights_buffer
+                            .get_data_buffer(m_idx + row_offset_r1).template get_base_ptr<float>() : 0.0f;
+                    }
+                }
 
                 // Read SF (must precede warpgroup_arrive)
                 float scale_a_0_lo, scale_a_1_lo;
@@ -2442,10 +2485,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         }
                     }
 
+                    stamp(4);
                     float weight_r0 = 0.0f, weight_r1 = 0.0f;
                     // For large-capacity specializations, cached same-address
                     // loads avoid a shuffle dependency in this register-heavy path.
-                    if constexpr (kNumMaxTokensPerRank <= 1024) {
+                    if constexpr (kHoistL1Weights) {
+                        weight_r0 = hoisted_weight_r0;
+                        weight_r1 = hoisted_weight_r1;
+                    } else if constexpr (kNumMaxTokensPerRank <= 1024) {
                         const int topk_weight_src_lane = static_cast<int>(lane_idx - col_idx);
                         if (col_idx == 0) {
                             weight_r0 = valid_r0 ? *l1_topk_weights_buffer
@@ -2495,6 +2542,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         sf_r1[g] = sf_pair.y; sf_inv_r1[g] = sf_inv_pair.y;
                     }
 
+                    stamp(13);
                     // Quantize and write to smem_cd_l1 (row-major, no swizzle).
                     auto* smem_cd_l1_wg = smem_cd_l1
                         + smem_cd_l1_wg_offset;
@@ -2526,6 +2574,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             *p1 = r1_pair.__x;
                     }
 
+                    stamp(14);
                     // Write L2-activation SF as float, one value per 64 output columns.
                     if (col_idx == 0 and not kLadderNoL1Stores) {
                         auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
@@ -2551,7 +2600,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     // STSM'd into smem). Using TMA for partial tiles is a large
                     // win for low-batch / decode where every tile is partial.
                     if constexpr (kSplitNWarpgroups) {
-                        stamp(4);
+                        stamp(15);
                         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                         stamp(5);
                         if (epilogue_warp_idx == 0 and not kLadderNoL1Stores and cute::elect_one_sync()) {
@@ -2759,24 +2808,16 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         const uint32_t m_idx_in_block = row_block_offset + row_in_wg;
                         if (m_idx_in_block >= valid_m or kLadderNoScatterStores) break;
 
-                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
-                        const uint32_t dst_rank_idx = src_metadata.rank_idx;
-                        const uint32_t dst_token_idx = src_metadata.token_idx;
-                        const uint32_t dst_topk_idx = src_metadata.topk_idx;
-
                         const uint32_t smem_elem_idx =
                             epilogue_wg_idx * WG_BLOCK_M * WG_BLOCK_N +
                             row_in_wg * WG_BLOCK_N +
                             (kSwizzleL2Staging ? (lane_in_row ^ (row_in_wg & 7u)) : lane_in_row) * cols_per_lane;
                         auto smem_ptr = smem_cd_base + smem_elem_idx * kCombineElementBytes;
-                        const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
-                                               .get_data_buffer(dst_token_idx);
                         constexpr uint32_t kScatterBytesPerLane =
                             (WG_BLOCK_N / 16) * kCombineElementBytes;
-                        auto dst_ptr = math::advance_ptr<uint8_t>(
-                            dst_token.get_base_ptr(),
-                            n_idx * kCombineElementBytes + lane_in_row * kScatterBytesPerLane);
-                        auto mapped_dst_ptr = sym_buffer.map(dst_ptr, dst_rank_idx);
+                        // The destination: read ahead at the start of the tile (opt02), or derived here from the
+                        // row's source metadata.
+                        auto mapped_dst_ptr = kHoistScatterMeta ? scatter_dst[j] : scatter_dst_of(row_in_wg);
 
                         if constexpr (kScatterBytesPerLane == 32) {
                             const auto packed0 = *reinterpret_cast<uint4*>(smem_ptr);
@@ -2813,7 +2854,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         atomicAdd(stamp_out + 56, 1ull);
                 }
             }
-            stamp_flush(13);
+            stamp_flush(16);
             return;
         }
         // Bulk scatter: all rows must have left this CTA before the cross-rank barrier says so.
@@ -2966,7 +3007,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     atomicAdd(stamp_out + 56, 1ull);
             }
         }
-        stamp_flush(13);
+        stamp_flush(16);
     }
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
