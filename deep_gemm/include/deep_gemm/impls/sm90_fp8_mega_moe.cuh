@@ -50,6 +50,10 @@
 //       64-register temporary instead of one 64 x 256 WGMMA into 128 registers, so that the FP32 running sums
 //       (128) plus the temporary fit in registers. This makes a 128 x 256 CTA tile (block_m 128, block_n 256,
 //       two warpgroups) usable: each weight tile is read once per 128 rows instead of once per 64.
+//   0x8 lean SiTU (only with DG_SM90_SITU_FAST_TANH, and only when beta / 2 is a small integer): the sigmoid's
+//       exp(-g) is taken as the (beta/2)-th power of the tanh's exp(-2g/beta), and the three reciprocals become
+//       one. Two exps and one reciprocal per element instead of three and three. Not bitwise identical to the
+//       fast tanh (differences of a few FP32 ulp before the FP8 quantization).
 #ifndef DG_SM90_MOE_OPT
 #define DG_SM90_MOE_OPT 0
 #endif
@@ -211,6 +215,22 @@ __forceinline__ __device__ float sm90_fp8_mega_moe_gated_activation(float gate, 
         up = __bfloat162float(__float2bfloat16_rn(up));
         const float e = kFastMath ? __expf(-gate) : expf(-gate);
         const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
+#if defined(DG_SM90_SITU_FAST_TANH) && ((DG_SM90_MOE_OPT) & 0x8)
+        constexpr int kHalfBeta = static_cast<int>(kSiTUBeta * 0.5f);
+        if constexpr (static_cast<float>(kHalfBeta) * 2.0f == kSiTUBeta and kHalfBeta >= 1 and kHalfBeta <= 8) {
+            // opt02 lean SiTU. With eg = exp(-2g/beta): exp(-g) = eg^(beta/2). An overflow of the power to +inf
+            // makes the denominator +inf and the result 0, which is the limit of the sigmoid there.
+            const float eg = __expf(cute::min(cute::max(gate * (-2.0f / kSiTUBeta), -30.0f), 30.0f));
+            const float eu = __expf(cute::min(cute::max(up * (-2.0f / kSiTULinearBeta), -30.0f), 30.0f));
+            float eg_pow = eg;
+            #pragma unroll
+            for (int i = 1; i < kHalfBeta; ++ i)
+                eg_pow *= eg;
+            const float numerator = (kSiTUBeta * kSiTULinearBeta) * (1.0f - eg) * (1.0f - eu);
+            const float denominator = (1.0f + eg_pow) * (1.0f + eg) * (1.0f + eu);
+            return numerator * math::fast_rcp(denominator);
+        }
+#endif
 #ifdef DG_SM90_SITU_FAST_TANH
         // Experiment (opt-in at JIT time through the environment variable of the same name):
         // tanh(x) = (1 - e^{-2x}) / (1 + e^{-2x}) with the fast exp and reciprocal already
