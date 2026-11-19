@@ -64,6 +64,22 @@ struct MegaMoESM90Config {
     }
 };
 
+// opt02: DG_SM90_MOE_OPT is a mask of opt-in kernel changes (see sm90_fp8_mega_moe.cuh); DG_SM90_MOE_DISPATCH_DEPTH
+// is the number of tokens each dispatch warp keeps in flight when bit 0x2 (batched dispatch) is set.
+static long get_sm90_moe_opt_mask() {
+    const char* raw = std::getenv("DG_SM90_MOE_OPT");
+    return raw == nullptr ? 0 : std::strtol(raw, nullptr, 0);
+}
+
+static int get_sm90_moe_dispatch_depth() {
+    if ((get_sm90_moe_opt_mask() & 0x2) == 0)
+        return 0;
+    const char* raw = std::getenv("DG_SM90_MOE_DISPATCH_DEPTH");
+    const int depth = raw == nullptr ? 4 : std::atoi(raw);
+    DG_HOST_ASSERT(depth >= 1 and depth <= 16);
+    return depth;
+}
+
 enum class Sm90MoeHardwareProfile {
     LowSm,
     HighSm
@@ -253,7 +269,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int smem_expert_count_size = align(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
     const int smem_send_buffers_size = align(
-        static_cast<int>(layout::Buffer(layout::Data(hidden), num_dispatch_warps, 1).get_num_bytes()),
+        static_cast<int>(layout::get_sm90_moe_dispatch_smem_bytes(
+            hidden, num_dispatch_warps, get_sm90_moe_dispatch_depth())),
         kSmemAlignment);
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
@@ -331,8 +348,8 @@ static uint32_t get_sm90_moe_pre_barrier_smem_size_for_combine(
     const int smem_expert_count = align(
         input.num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
     const int smem_send_buffers = align(
-        static_cast<int>(layout::Buffer(
-            layout::Data(input.hidden), num_dispatch_warps, 1).get_num_bytes()),
+        static_cast<int>(layout::get_sm90_moe_dispatch_smem_bytes(
+            input.hidden, num_dispatch_warps, get_sm90_moe_dispatch_depth())),
         kSmemAlignment);
     const int smem_cd_l2 = config.direct_l2_scatter ? 0 :
         num_epilogue_warpgroups * static_cast<int>(wg_layout.block_m) *

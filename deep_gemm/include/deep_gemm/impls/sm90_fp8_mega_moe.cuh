@@ -39,8 +39,14 @@
 //   0x1 bulk L2 scatter: the L2 epilogue stages the BF16 tile row-major in SMEM and sends every row to its
 //       combine slot with one asynchronous bulk copy (cp.async.bulk), instead of 16-byte stores per lane
 //       issued row pair by row pair after a dependent metadata read. Same bytes, same values.
+//   0x2 batched dispatch: each dispatch warp keeps DG_SM90_MOE_DISPATCH_DEPTH tokens in flight (token, scale
+//       factors and top-k weight all pulled with bulk copies under one mbarrier) instead of one token at a time
+//       with synchronous remote reads of the scale factors and the weight. Same bytes, same values.
 #ifndef DG_SM90_MOE_OPT
 #define DG_SM90_MOE_OPT 0
+#endif
+#ifndef DG_SM90_MOE_DISPATCH_DEPTH
+#define DG_SM90_MOE_DISPATCH_DEPTH 0
 #endif
 
 namespace deep_gemm {
@@ -382,8 +388,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     // dispatch scratch capacity even though it does not run dispatch pull.
     constexpr uint32_t SMEM_EXPERT_COUNT_SIZE =
         math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment);
-    constexpr uint32_t SMEM_SEND_BUFFER_SIZE =
-        math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment);
+    constexpr uint32_t kDispatchDepth = DG_SM90_MOE_DISPATCH_DEPTH;
+    constexpr uint32_t SMEM_SEND_BUFFER_SIZE = math::constexpr_align(
+        layout::get_sm90_moe_dispatch_smem_bytes(kHidden, kNumDispatchWarps, kDispatchDepth),
+        kSharedMemoryAlignment);
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
     // SFA holds one aligned BLOCK_M-float vector per 64 channels. L1 uses every
@@ -722,7 +730,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         uint32_t expert_pool_block_offset = 0;
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
-        for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
+        // Locate pool token `token_idx`: its expert (current_expert_idx), source rank and index within that
+        // rank's tokens for the expert. Warp-collective; returns false when the pool is exhausted.
+        uint32_t current_rank_in_expert_idx = 0, token_idx_in_rank = 0, token_idx_in_expert = 0;
+        const auto locate_token = [&](const uint32_t token_idx) -> bool {
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
                 if (++ current_expert_idx >= kNumExpertsPerRank)
@@ -732,7 +743,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
             }
             if (current_expert_idx >= kNumExpertsPerRank)
-                break;
+                return false;
 
             if (old_expert_idx != current_expert_idx) {
                 old_expert_idx = current_expert_idx;
@@ -745,15 +756,13 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             }
 
             // Round-robin rank selection (identical to SM100)
-            uint32_t current_rank_in_expert_idx;
             uint32_t remaining[kNumRanksPerLane];
             #pragma unroll
             for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
                 remaining[i] = stored_rank_count[i];
             uint32_t offset = 0;
-            uint32_t token_idx_in_expert = token_idx - expert_start_idx;
+            token_idx_in_expert = token_idx - expert_start_idx;
             uint32_t slot_idx = token_idx_in_expert;
-            uint32_t token_idx_in_rank;
             while (true) {
                 uint32_t num_actives_in_lane = 0;
                 uint32_t min_in_lane = 0xffffffff;
@@ -788,6 +797,118 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
                     remaining[i] -= cute::min(remaining[i], length);
             }
+
+            return true;
+        };
+
+        if constexpr (kDispatchDepth > 0) {
+            // opt02 batched dispatch: kDispatchDepth tokens in flight per warp.
+            constexpr uint32_t kNumSFFloats = kHidden / 128;
+            constexpr uint32_t kTokenBytes = kHidden;
+            constexpr uint32_t kSFBytes = kNumSFFloats * sizeof(float);
+            constexpr uint32_t kSlotBytes = layout::get_sm90_moe_dispatch_slot_bytes(kHidden);
+            DG_STATIC_ASSERT(kHidden % 128 == 0 and kTokenBytes % 16 == 0 and kSFBytes % 16 == 0 and
+                             kSlotBytes == kTokenBytes + kSFBytes + 16,
+                             "Batched dispatch needs 16-byte aligned token and SF records");
+            const auto slots = math::advance_ptr<uint8_t>(smem_buffer, SMEM_EXPERT_COUNT_SIZE) +
+                warp_idx * kDispatchDepth * kSlotBytes;
+            const auto local_sf_ptr = l1_sf_buffer.get_base_ptr<float>();
+            uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx;
+            bool exhausted = false;
+            while (not exhausted) {
+                uint32_t batch_pool_token_idx[kDispatchDepth], batch_block_idx[kDispatchDepth];
+                uint32_t batch_weight_idx[kDispatchDepth];
+                uint32_t batch_count = 0;
+                #pragma unroll
+                for (uint32_t g = 0; g < kDispatchDepth; ++ g) {
+                    batch_pool_token_idx[g] = batch_block_idx[g] = batch_weight_idx[g] = 0;
+                    if (exhausted)
+                        continue;
+                    if (not locate_token(token_idx)) {
+                        exhausted = true;
+                        continue;
+                    }
+                    const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
+                        current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+                    const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
+                    const uint32_t src_topk_idx  = src_token_topk_idx % kNumTopk;
+                    const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+                    const auto slot = slots + g * kSlotBytes;
+                    if (cute::elect_one_sync()) {
+                        ptx::tma_load_1d(
+                            slot,
+                            sym_buffer.map(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
+                                           current_rank_in_expert_idx),
+                            pull_mbarrier, kTokenBytes);
+                        ptx::tma_load_1d(
+                            slot + kTokenBytes,
+                            sym_buffer.map(input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
+                                           current_rank_in_expert_idx),
+                            pull_mbarrier, kSFBytes);
+                        ptx::tma_load_1d(
+                            slot + kTokenBytes + kSFBytes,
+                            sym_buffer.map(
+                                input_topk_weights_buffer.get_base_ptr<float>() + (src_token_topk_idx & ~3u),
+                                current_rank_in_expert_idx),
+                            pull_mbarrier, 16);
+                        *workspace.get_token_src_metadata_ptr(pool_token_idx) =
+                            {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+                    }
+                    __syncwarp();
+                    batch_pool_token_idx[g] = pool_token_idx;
+                    batch_block_idx[g] = expert_pool_block_offset + token_idx_in_expert / BLOCK_M;
+                    batch_weight_idx[g] = src_token_topk_idx & 3u;
+                    batch_count = g + 1;
+                    token_idx += kNumGlobalWarps;
+                }
+                if (batch_count == 0)
+                    break;
+
+                if (cute::elect_one_sync()) {
+                    ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, batch_count * kSlotBytes);
+                    ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
+                }
+                __syncwarp();
+
+                #pragma unroll
+                for (uint32_t g = 0; g < kDispatchDepth; ++ g) {
+                    if (g >= batch_count)
+                        continue;
+                    const auto slot = slots + g * kSlotBytes;
+                    const auto slot_sf = reinterpret_cast<const float*>(slot + kTokenBytes);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFFloats, 32u); ++ i) {
+                        const uint32_t j = i * 32 + lane_idx;
+                        if (j < kNumSFFloats)
+                            local_sf_ptr[j * kSFPoolStrideTokens + batch_pool_token_idx[g]] = ptx::ld_shared(slot_sf + j);
+                    }
+                    if (cute::elect_one_sync()) {
+                        *l1_topk_weights_buffer.get_data_buffer(batch_pool_token_idx[g]).get_base_ptr<float>() =
+                            ptx::ld_shared(reinterpret_cast<const float*>(slot + kTokenBytes + kSFBytes) +
+                                           batch_weight_idx[g]);
+                        ptx::tma_store_1d(
+                            l1_token_buffer.get_data_buffer(batch_pool_token_idx[g]).get_base_ptr(),
+                            slot, kTokenBytes);
+                    }
+                    __syncwarp();
+                }
+                if (cute::elect_one_sync()) {
+                    cute::tma_store_arrive();
+                    ptx::tma_store_wait<0>();
+                    #pragma unroll
+                    for (uint32_t g = 0; g < kDispatchDepth; ++ g) {
+                        if (g < batch_count)
+                            ptx::red_add_rel(workspace.get_l1_full_count_ptr(batch_block_idx[g]), 1);
+                    }
+                }
+                __syncwarp();
+            }
+            return;
+        }
+
+        for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
+            if (not locate_token(token_idx))
+                break;
 
             const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);

@@ -46,6 +46,22 @@ CUTLASS_HOST_DEVICE constexpr bool is_sm90_moe_combine_vectorization_legal(
            (hidden / num_chunks) % (32u * kSM90MoeCombineElemsPerLane) == 0u;
 }
 
+// opt02 batched dispatch: each dispatch warp keeps `depth` tokens in flight. A slot holds the FP8 token,
+// its per-128 scale factors (rounded up to 16 bytes) and one 16-byte chunk of the top-k weights.
+CUTLASS_HOST_DEVICE constexpr uint32_t get_sm90_moe_dispatch_slot_bytes(const uint32_t hidden) {
+    const uint32_t token_bytes = (hidden + 15u) / 16u * 16u;
+    const uint32_t sf_bytes = ((hidden / 128u) * 4u + 15u) / 16u * 16u;
+    return token_bytes + sf_bytes + 16u;
+}
+
+// Bytes of dispatch scratch per CTA before 1024-byte alignment. depth == 0: the original layout
+// (one token per dispatch warp).
+CUTLASS_HOST_DEVICE constexpr uint32_t get_sm90_moe_dispatch_smem_bytes(
+    const uint32_t hidden, const uint32_t num_dispatch_warps, const uint32_t depth) {
+    return depth == 0 ? ((hidden + 15u) / 16u * 16u) * num_dispatch_warps :
+        get_sm90_moe_dispatch_slot_bytes(hidden) * depth * num_dispatch_warps;
+}
+
 struct Sm90MoeWarpgroupLayout {
     bool split_n;
     uint32_t split_m, split_n_count;

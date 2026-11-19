@@ -99,6 +99,8 @@ public:
         if (const char* raw = std::getenv("DG_SM90_MOE_OPT"))
             if (const long opt = std::strtol(raw, nullptr, 0); opt != 0)
                 fast_tanh_define += std::format("\n#define DG_SM90_MOE_OPT {}", opt);
+        if (const int depth = get_sm90_moe_dispatch_depth(); depth > 0)
+            fast_tanh_define += std::format("\n#define DG_SM90_MOE_DISPATCH_DEPTH {}", depth);
         deep_jit::cuda::CompilerOptions compiler_options;
         if (args.kernel_phase == KernelPhase::Linear1 and env_is("DG_SM90_MOE_USE_FAST_MATH", "1"))
             compiler_options.fast_math = true;
