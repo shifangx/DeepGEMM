@@ -54,6 +54,11 @@
 //       exp(-g) is taken as the (beta/2)-th power of the tanh's exp(-2g/beta), and the three reciprocals become
 //       one. Two exps and one reciprocal per element instead of three and three. Not bitwise identical to the
 //       fast tanh (differences of a few FP32 ulp before the FP8 quantization).
+//   0x10 swizzled L2 staging: the BF16 tile staged in SMEM by the L2 epilogue is stored with the 16-byte chunks
+//        of each row rotated by (row % 8) (XOR), so that the 8 rows a warp writes with one instruction fall into
+//        different SMEM banks; the scatter reads it back through the same mapping. Same bytes, same values.
+//   0x20 swizzled L1 staging: the same for the FP8 tile of the L1 epilogue, by giving the L1-output tensor map
+//        the 128-byte swizzle (the host builds the descriptor accordingly). Same bytes, same values.
 #ifndef DG_SM90_MOE_OPT
 #define DG_SM90_MOE_OPT 0
 #endif
@@ -387,6 +392,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr bool kDirectL2Scatter =
         (!kSwapABActive) && MegaMoEPhase::direct_l2_scatter && WG_BLOCK_N == 128;
     constexpr bool kBF16ScaledAccum = kBF16ScaledAccumRequested;
+    constexpr bool kSwizzleL1Staging =
+        ((DG_SM90_MOE_OPT) & 0x20u) != 0 and MegaMoEPhase::runs_linear1 and
+        kSplitNWarpgroups and not kSwapABActive and L1_OUT_BLOCK_N == 128;
+    constexpr bool kSwizzleL2Staging =
+        ((DG_SM90_MOE_OPT) & 0x10u) != 0 and ((DG_SM90_MOE_OPT) & 0x1u) == 0 and MegaMoEPhase::runs_linear2 and
+        not kSwapABActive and not kDirectL2Scatter and WG_BLOCK_N == 128;
     constexpr bool kBulkL2Scatter =
         ((DG_SM90_MOE_OPT) & 0x1u) != 0 and MegaMoEPhase::runs_linear2 and
         not kSwapABActive and not kDirectL2Scatter;
@@ -2280,12 +2291,16 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         const __nv_fp8x2_e4m3 r1_pair(make_float2(v10, v11));
 
                         const uint32_t col = p * 8 + col_idx * 2;
+                        const uint32_t col_in_row = (kSplitNWarpgroups ? wg_l1_out_n_idx : 0) + col;
+                        // opt02 swizzled staging: the 128-byte swizzle of the tensor map (16-byte chunk ^ row % 8).
+                        const auto swizzled = [](const uint32_t row, const uint32_t byte_in_row) {
+                            return kSwizzleL1Staging ?
+                                ((((byte_in_row >> 4) ^ (row & 7u)) << 4) | (byte_in_row & 15u)) : byte_in_row;
+                        };
                         auto* p0 = reinterpret_cast<uint16_t*>(
-                            smem_cd_l1_wg + r_0 * WG_SMEM_CD_L1_STRIDE_N +
-                            (kSplitNWarpgroups ? wg_l1_out_n_idx : 0) + col);
+                            smem_cd_l1_wg + r_0 * WG_SMEM_CD_L1_STRIDE_N + swizzled(r_0, col_in_row));
                         auto* p1 = reinterpret_cast<uint16_t*>(
-                            smem_cd_l1_wg + r_1 * WG_SMEM_CD_L1_STRIDE_N +
-                            (kSplitNWarpgroups ? wg_l1_out_n_idx : 0) + col);
+                            smem_cd_l1_wg + r_1 * WG_SMEM_CD_L1_STRIDE_N + swizzled(r_1, col_in_row));
                         if (valid_r0)
                             *p0 = r0_pair.__x;
                         if (valid_r1)
@@ -2452,10 +2467,13 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                                   const float value0,
                                                   const float value1) {
                                 // Bulk scatter: one row-major BLOCK_M x BLOCK_N tile, so that a row is contiguous.
+                                // opt02 swizzled staging: 8-element (16-byte) chunk ^ row % 8.
+                                const uint32_t staged_col = kSwizzleL2Staging ?
+                                    ((((col >> 3) ^ (row & 7u)) << 3) | (col & 7u)) : col;
                                 const uint32_t elem_idx = kBulkL2Scatter ?
                                     (row_block_offset + row) * BLOCK_N + wg_n_idx + col :
                                     epilogue_wg_idx * WG_BLOCK_M * WG_BLOCK_N +
-                                    row * WG_BLOCK_N + col;
+                                    row * WG_BLOCK_N + staged_col;
                                 store_l2_pair(elem_idx, value0, value1);
                             };
                             if (valid_r0) {
@@ -2524,7 +2542,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
                         const uint32_t smem_elem_idx =
                             epilogue_wg_idx * WG_BLOCK_M * WG_BLOCK_N +
-                            row_in_wg * WG_BLOCK_N + lane_in_row * cols_per_lane;
+                            row_in_wg * WG_BLOCK_N +
+                            (kSwizzleL2Staging ? (lane_in_row ^ (row_in_wg & 7u)) : lane_in_row) * cols_per_lane;
                         auto smem_ptr = smem_cd_base + smem_elem_idx * kCombineElementBytes;
                         const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
                                                .get_data_buffer(dst_token_idx);

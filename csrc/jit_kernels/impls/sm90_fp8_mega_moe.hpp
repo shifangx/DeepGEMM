@@ -266,11 +266,16 @@ static void sm90_fp8_mega_moe(
     const int wg_l1_out_block_n = wg_block_n / 2;
     const int l1_output_box_n = wg_layout.split_n ? l1_config.block_n / 2 : wg_l1_out_block_n;
     const int l1_output_box_m = wg_layout.split_n ? l1_config.block_m : wg_block_m;
+    // opt02 (DG_SM90_MOE_OPT bit 0x20): the split-N epilogue stages a 64 x 128-byte tile; with the 128-byte
+    // swizzle its rows land in different SMEM banks. Must match kSwizzleL1Staging in the kernel.
+    const int l1_output_swizzle =
+        ((get_sm90_moe_opt_mask() & 0x20) != 0 and wg_layout.split_n and not l1_config.swap_ab and
+         l1_output_box_n == 128) ? 128 : 0;
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, l1_config.num_max_pool_tokens,
                                                        l1_output_box_n, l1_output_box_m,
                                                        static_cast<int>(l2_acts.stride(-2)),
-                                                       0);
+                                                       l1_output_swizzle);
     const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
                                                      intermediate_hidden, l2_config.num_max_pool_tokens,
                                                      l2_tma_block_k, l2_config.block_m,
