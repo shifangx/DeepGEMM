@@ -34,6 +34,8 @@
 //         loaders do not wait for the pool, i.e. only the dispatch preamble is left of the dispatch role
 //   0x200 L2 scatter without its global stores (BF16 cast, SMEM staging and barriers stay)
 //   0x400 L1 epilogue without its TMA store and scale-factor stores (activation, quantization, SMEM stay)
+//   0x800 no promotion: the running sums take the last WGMMA result as it is (no scale-and-add per K block);
+//         WGMMAs and epilogues stay
 // The control flow, barriers and cross-rank synchronisation stay in every case.
 #ifndef DG_SM90_LADDER
 #define DG_SM90_LADDER 0
@@ -315,6 +317,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr bool kLadderPoolReady    = (kLadder & 0x100u) != 0;
     constexpr bool kLadderNoScatterStores = (kLadder & 0x200u) != 0;
     constexpr bool kLadderNoL1Stores   = (kLadder & 0x400u) != 0;
+    constexpr bool kLadderNoPromotion  = (kLadder & 0x800u) != 0;
 
     // Thread / warp identification
     const uint32_t sm_idx     = blockIdx.x;
@@ -1409,6 +1412,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         // share the same scalar.
                         #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                            if constexpr (kLadderNoPromotion) {
+                                #pragma unroll
+                                for (uint32_t j = 0; j < 4; ++ j)
+                                    final_accum[i*4+j] = accum[i*4+j];
+                                continue;
+                            }
                             const float sb = (i & 1u) ? up_sf : gate_sf;
                             final_accum[i*4+0] += scale_a_0_lo * sb * accum[i*4+0];
                             final_accum[i*4+1] += scale_a_0_lo * sb * accum[i*4+1];
@@ -1549,6 +1558,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     // L2 weight SF is per 128 output columns; M64N256 spans two SF groups.
                     #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                        if constexpr (kLadderNoPromotion) {
+                            #pragma unroll
+                            for (uint32_t j = 0; j < 4; ++ j)
+                                final_accum[i*4+j] = accum[i*4+j];
+                            continue;
+                        }
                         const float l2_sf = (i < 16u) ? l2_sf_lo : l2_sf_hi;
                         final_accum[i*4+0] += scale_a_0_lo * l2_sf * accum[i*4+0];
                         final_accum[i*4+1] += scale_a_0_lo * l2_sf * accum[i*4+1];
@@ -1579,6 +1594,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     // L2 second half: same SFA half, still choose weight SF by N chunk.
                     #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                        if constexpr (kLadderNoPromotion) {
+                            #pragma unroll
+                            for (uint32_t j = 0; j < 4; ++ j)
+                                final_accum[i*4+j] = accum[i*4+j];
+                            continue;
+                        }
                         const float l2_sf = (i < 16u) ? l2_sf_lo : l2_sf_hi;
                         final_accum[i*4+0] += scale_a_0_hi * l2_sf * accum[i*4+0];
                         final_accum[i*4+1] += scale_a_0_hi * l2_sf * accum[i*4+1];
