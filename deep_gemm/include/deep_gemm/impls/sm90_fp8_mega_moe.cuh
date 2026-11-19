@@ -487,9 +487,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr bool kHoistScatterMeta =
         ((DG_SM90_MOE_OPT) & 0x80u) != 0 and MegaMoEPhase::runs_linear2 and
         not kSwapABActive and not kDirectL2Scatter and not kBulkL2Scatter;
-    constexpr bool kHoistL1Weights =
-        ((DG_SM90_MOE_OPT) & 0x100u) != 0 and MegaMoEPhase::runs_linear1 and not kSwapABActive and
-        BLOCK_K == 128 and not kBF16ScaledAccumRequested and not kSplitWGMMAN and not kOverlapPromotion;
     constexpr bool kSplitWGMMAN =
         ((DG_SM90_MOE_OPT) & 0x4u) != 0 and not kSplitNWarpgroups and WG_BLOCK_N == 256 and
         BLOCK_K == 128 and not kBF16ScaledAccumRequested and not kSwapABActive;
@@ -497,6 +494,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr bool kOverlapPromotion =
         ((DG_SM90_MOE_OPT) & 0x40u) != 0 and not kSplitWGMMAN and WG_BLOCK_N == 128 and
         BLOCK_K == 128 and not kBF16ScaledAccumRequested and not kSwapABActive;
+    constexpr bool kHoistL1Weights =
+        ((DG_SM90_MOE_OPT) & 0x100u) != 0 and MegaMoEPhase::runs_linear1 and not kSwapABActive and
+        BLOCK_K == 128 and not kBF16ScaledAccumRequested and not kSplitWGMMAN and not kOverlapPromotion;
     using L1WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N / kNumWGMMAsPerTile>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N * kNumWGMMAsPerTile == WG_BLOCK_N and L1WGMMA::K == 32,
                   "Unexpected WGMMA shape");
