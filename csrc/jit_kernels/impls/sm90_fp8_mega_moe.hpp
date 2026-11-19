@@ -95,6 +95,10 @@ public:
             if (ladder != 0)
                 fast_tanh_define += std::format("\n#define DG_SM90_LADDER {}", ladder);
         }
+        // opt02 optimizations (see the top of sm90_fp8_mega_moe.cuh): DG_SM90_MOE_OPT is a mask, default 0.
+        if (const char* raw = std::getenv("DG_SM90_MOE_OPT"))
+            if (const long opt = std::strtol(raw, nullptr, 0); opt != 0)
+                fast_tanh_define += std::format("\n#define DG_SM90_MOE_OPT {}", opt);
         deep_jit::cuda::CompilerOptions compiler_options;
         if (args.kernel_phase == KernelPhase::Linear1 and env_is("DG_SM90_MOE_USE_FAST_MATH", "1"))
             compiler_options.fast_math = true;

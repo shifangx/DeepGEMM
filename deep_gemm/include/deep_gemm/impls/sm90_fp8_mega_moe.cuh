@@ -35,6 +35,14 @@
 #define DG_SM90_LADDER 0
 #endif
 
+// opt02 optimizations, opt-in at JIT time through DG_SM90_MOE_OPT (a mask; 0 = the unchanged kernel).
+//   0x1 bulk L2 scatter: the L2 epilogue stages the BF16 tile row-major in SMEM and sends every row to its
+//       combine slot with one asynchronous bulk copy (cp.async.bulk), instead of 16-byte stores per lane
+//       issued row pair by row pair after a dependent metadata read. Same bytes, same values.
+#ifndef DG_SM90_MOE_OPT
+#define DG_SM90_MOE_OPT 0
+#endif
+
 namespace deep_gemm {
 
 // Pipeline (cluster=1, no TMA multicast):
@@ -342,6 +350,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr bool kDirectL2Scatter =
         (!kSwapABActive) && MegaMoEPhase::direct_l2_scatter && WG_BLOCK_N == 128;
     constexpr bool kBF16ScaledAccum = kBF16ScaledAccumRequested;
+    constexpr bool kBulkL2Scatter =
+        ((DG_SM90_MOE_OPT) & 0x1u) != 0 and MegaMoEPhase::runs_linear2 and
+        not kSwapABActive and not kDirectL2Scatter;
     using L1WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N == WG_BLOCK_N and L1WGMMA::K == 32,
                   "Unexpected WGMMA shape");
@@ -1769,7 +1780,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             }
             // Skip epilogue when block is past valid M (still must release via empty).
             if (row_block_offset >= valid_m) {
-                if constexpr (MegaMoEPhase::runs_linear1 and kWarpgroupSplitM > 1 and not kSplitNWarpgroups) {
+                if constexpr (kBulkL2Scatter) {
+                    // Same barrier sequence as the bulk-scatter epilogue of the other warpgroups.
+                    ptx::tma_store_wait<0>();
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                } else if constexpr (MegaMoEPhase::runs_linear1 and kWarpgroupSplitM > 1 and not kSplitNWarpgroups) {
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
                 } else {
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -2140,6 +2156,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         *reinterpret_cast<uint32_t*>(smem_cd_l2 + elem_idx) =
                             math::cast_into_bf16_and_pack(value0, value1);
                     };
+                    if constexpr (kBulkL2Scatter) {
+                        // The bulk copies of the previous tile read this SMEM region: they must have
+                        // completed (for the threads that issued them) before anyone overwrites it.
+                        ptx::tma_store_wait<0>();
+                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    }
                     if constexpr (kSwapABActive) {
                         auto store_value = [&](const uint32_t& token,
                                                const uint32_t& col,
@@ -2180,7 +2202,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                                   const uint32_t col,
                                                   const float value0,
                                                   const float value1) {
-                                const uint32_t elem_idx =
+                                // Bulk scatter: one row-major BLOCK_M x BLOCK_N tile, so that a row is contiguous.
+                                const uint32_t elem_idx = kBulkL2Scatter ?
+                                    (row_block_offset + row) * BLOCK_N + wg_n_idx + col :
                                     epilogue_wg_idx * WG_BLOCK_M * WG_BLOCK_N +
                                     row * WG_BLOCK_N + col;
                                 store_l2_pair(elem_idx, value0, value1);
@@ -2204,6 +2228,29 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         }
                     }
 
+                    if constexpr (kBulkL2Scatter) {
+                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                        // One bulk copy per valid row, issued by the first BLOCK_M math threads (one row
+                        // each, so the metadata reads of all rows are in flight together). The copies run
+                        // while the next tile's GEMM does; they are waited for before SMEM is reused.
+                        constexpr uint32_t kRowBytes = BLOCK_N * kCombineElementBytes;
+                        DG_STATIC_ASSERT(kRowBytes % 16 == 0 and (kHidden * kCombineElementBytes) % 16 == 0,
+                                         "Bulk scatter rows must be 16-byte aligned");
+                        if (epilogue_thread_idx < valid_m) {
+                            const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + epilogue_thread_idx);
+                            const auto dst_token = combine_token_buffer.get_rank_buffer(src_metadata.topk_idx)
+                                                   .get_data_buffer(src_metadata.token_idx);
+                            const auto dst_ptr = sym_buffer.map(
+                                math::advance_ptr<uint8_t>(
+                                    dst_token.get_base_ptr(), n_block_idx * BLOCK_N * kCombineElementBytes),
+                                src_metadata.rank_idx);
+                            cute::tma_store_fence();
+                            ptx::tma_store_1d(
+                                dst_ptr, smem_cd_base + epilogue_thread_idx * kRowBytes, kRowBytes);
+                            cute::tma_store_arrive();
+                        }
+                        return;
+                    }
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
                     // Scatter to remote ranks via NVLink (one row per warp-pair)
@@ -2266,6 +2313,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         if constexpr (!MegaMoEPhase::runs_linear2) {
             return;
         }
+        // Bulk scatter: all rows must have left this CTA before the cross-rank barrier says so.
+        if constexpr (kBulkL2Scatter)
+            ptx::tma_store_wait<0>();
 
         // Combine
         // NVLink barrier first: signals remote ranks that this rank's GEMM
