@@ -59,6 +59,10 @@
 //        different SMEM banks; the scatter reads it back through the same mapping. Same bytes, same values.
 //   0x20 swizzled L1 staging: the same for the FP8 tile of the L1 epilogue, by giving the L1-output tensor map
 //        the 128-byte swizzle (the host builds the descriptor accordingly). Same bytes, same values.
+//   0x40 overlapped promotion: the FP32 "promotion" of each WGMMA result (running sum += activation scale *
+//        weight scale * WGMMA accumulator, 64 FMAs per thread per K block in L1 and per K half in L2) is done
+//        while the next WGMMA is running, by alternating between two accumulator register sets, instead of
+//        between two WGMMAs. Same operations in the same order: bitwise identical.
 #ifndef DG_SM90_MOE_OPT
 #define DG_SM90_MOE_OPT 0
 #endif
@@ -405,6 +409,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         ((DG_SM90_MOE_OPT) & 0x4u) != 0 and not kSplitNWarpgroups and WG_BLOCK_N == 256 and
         BLOCK_K == 128 and not kBF16ScaledAccumRequested and not kSwapABActive;
     constexpr uint32_t kNumWGMMAsPerTile = kSplitWGMMAN ? 2 : 1;
+    constexpr bool kOverlapPromotion =
+        ((DG_SM90_MOE_OPT) & 0x40u) != 0 and not kSplitWGMMAN and WG_BLOCK_N == 128 and
+        BLOCK_K == 128 and not kBF16ScaledAccumRequested and not kSwapABActive;
     using L1WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N / kNumWGMMAsPerTile>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N * kNumWGMMAsPerTile == WG_BLOCK_N and L1WGMMA::K == 32,
                   "Unexpected WGMMA shape");
@@ -592,7 +599,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     // four-warpgroup split-N path uses smaller front-end allocations.
     // opt02: eight dispatch warps (256 threads) take the small front-end allocations as well.
     constexpr bool kSmallFrontendRegisters =
-        kNumEpilogueThreads == 512 or kNumDispatchThreads >= 256 or kSplitWGMMAN;
+        kNumEpilogueThreads == 512 or kNumDispatchThreads >= 256 or kSplitWGMMAN or kOverlapPromotion;
     constexpr uint32_t kNumDispatchRegisters    = kSmallFrontendRegisters ? 32 : 48;
     constexpr bool kCompactFrontendWarpgroup = (kNumDispatchWarps == 2 and kNumMMANonEpilogueWarps == 2);
     constexpr uint32_t kNumNonEpilogueRegisters = kSmallFrontendRegisters ? 24 :
@@ -603,7 +610,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
          kNumNonEpilogueRegisters * kNumNonEpilogueThreads) / kNumEpilogueThreads / 8 * 8;
     constexpr uint32_t kNumEpilogueRegisters    =
         kNumEpilogueThreads == 512 ? 112 :
-        (kSplitWGMMAN ? (kNumSpareEpilogueRegisters < 232 ? kNumSpareEpilogueRegisters : 232) : 208);
+        ((kSplitWGMMAN or kOverlapPromotion) ?
+            (kNumSpareEpilogueRegisters < 232 ? kNumSpareEpilogueRegisters : 232) : 208);
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
@@ -2014,11 +2022,104 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 }
             };
 
+            // opt02 overlapped promotion (see the top of this file).
+            const auto run_overlapped_gemm_loop = [&]() {
+                if constexpr (kOverlapPromotion) {
+                    constexpr uint32_t kL1SFKBlocks   = kHidden / 128;
+                    constexpr uint32_t kL2SFKBlocks   = kIntermediateHidden / 128;
+                    constexpr uint32_t kL1SFGateBlks  = kIntermediateHidden / 128;
+                    constexpr uint32_t kL1SFPerExpert = (kIntermediateHidden * 2 / 128) * kL1SFKBlocks;
+                    constexpr uint32_t kL2SFPerExpert = (kHidden / 128) * kL2SFKBlocks;
+                    float accum_b[kAccumPerThread];
+                    // Issue one WGMMA group into `d` without waiting for it.
+                    const auto issue_wgmma = [&](float* d, const uint32_t k_begin, const uint32_t num_wgmmas) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(d[i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0; k < num_wgmmas; ++ k) {
+                            auto desc_a = mma::sm90::make_smem_desc(
+                                smem_a[stage_idx] + row_block_offset * BLOCK_K + k_begin + k * WGMMA::K, 1);
+                            auto desc_b = mma::sm90::make_smem_desc(
+                                smem_b[stage_idx] + wg_n_idx * BLOCK_K + k_begin + k * WGMMA::K, 1);
+                            WGMMA::wgmma(desc_a, desc_b, d, k);
+                        }
+                        ptx::warpgroup_commit_batch();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(d[i]);
+                    };
+                    // final_accum += row scale * weight scale * d. The weight scale alternates gate / up per 8-column
+                    // chunk in L1 and is one value per 128 columns in L2 (w1 unused there: WG_BLOCK_N == 128).
+                    const auto promote = [&](const float* d, const float s0, const float s1,
+                                             const float w0, const float w1) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                            const float w = (is_linear1_phase and (i & 1u)) ? w1 : w0;
+                            final_accum[i*4+0] += s0 * w * d[i*4+0];
+                            final_accum[i*4+1] += s0 * w * d[i*4+1];
+                            final_accum[i*4+2] += s1 * w * d[i*4+2];
+                            final_accum[i*4+3] += s1 * w * d[i*4+3];
+                        }
+                    };
+
+                    float pend_s0 = 0.0f, pend_s1 = 0.0f, pend_w0 = 0.0f, pend_w1 = 0.0f;
+                    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                        full_barriers[stage_idx]->wait(phase);
+                        const float scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r0);
+                        const float scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r1);
+                        if (is_linear1_phase) {
+                            const uint32_t gate_n = (n_block_idx * BLOCK_N + wg_n_idx) / 256u;
+                            const float* base = l1_weights_sf + local_expert_idx * kL1SFPerExpert + k_block_idx;
+                            const float gate_sf = __ldg(base + gate_n * kL1SFKBlocks);
+                            const float up_sf   = __ldg(base + (kL1SFGateBlks + gate_n) * kL1SFKBlocks);
+                            // K block k goes to set A (accum) when k is even, to set B when odd; the previous
+                            // block's set is promoted while this block's WGMMAs run.
+                            if (k_block_idx & 1u) {
+                                issue_wgmma(accum_b, 0, BLOCK_K / WGMMA::K);
+                                promote(accum, pend_s0, pend_s1, pend_w0, pend_w1);
+                            } else {
+                                issue_wgmma(accum, 0, BLOCK_K / WGMMA::K);
+                                if (k_block_idx > 0)
+                                    promote(accum_b, pend_s0, pend_s1, pend_w0, pend_w1);
+                            }
+                            ptx::warpgroup_wait<0>();
+                            arrive_empty_barrier(stage_idx);
+                            pend_s0 = scale_a_0_lo, pend_s1 = scale_a_1_lo, pend_w0 = gate_sf, pend_w1 = up_sf;
+                        } else {
+                            const float scale_a_0_hi = ptx::ld_shared(smem_sfa[stage_idx] + kL2SFAHalfStride + row_offset_r0);
+                            const float scale_a_1_hi = ptx::ld_shared(smem_sfa[stage_idx] + kL2SFAHalfStride + row_offset_r1);
+                            const uint32_t sf_n = (n_block_idx * BLOCK_N + wg_n_idx) / 128u;
+                            const float l2_sf = __ldg(l2_weights_sf + local_expert_idx * kL2SFPerExpert + k_block_idx +
+                                                      sf_n * kL2SFKBlocks);
+                            // First K half into set A; the previous block's second half (set B) is promoted meanwhile.
+                            issue_wgmma(accum, 0, (BLOCK_K / 2) / WGMMA::K);
+                            if (k_block_idx > 0)
+                                promote(accum_b, pend_s0, pend_s1, pend_w0, pend_w1);
+                            ptx::warpgroup_wait<0>();
+                            // Second K half into set B; the first half (set A) is promoted meanwhile.
+                            issue_wgmma(accum_b, BLOCK_K / 2, (BLOCK_K / 2) / WGMMA::K);
+                            promote(accum, scale_a_0_lo, scale_a_1_lo, l2_sf, l2_sf);
+                            ptx::warpgroup_wait<0>();
+                            arrive_empty_barrier(stage_idx);
+                            pend_s0 = scale_a_0_hi, pend_s1 = scale_a_1_hi, pend_w0 = l2_sf, pend_w1 = l2_sf;
+                        }
+                    }
+                    // The last group is still to be promoted.
+                    if (is_linear1_phase and ((num_k_blocks - 1) & 1u) == 0) {
+                        promote(accum, pend_s0, pend_s1, pend_w0, pend_w1);
+                    } else {
+                        promote(accum_b, pend_s0, pend_s1, pend_w0, pend_w1);
+                    }
+                }
+            };
+
             if constexpr (kLadderSkipMMA) {
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                     full_barriers[stage_idx]->wait(phase);
                     arrive_empty_barrier(stage_idx);
                 }
+            } else if constexpr (kOverlapPromotion) {
+                run_overlapped_gemm_loop();
             } else if constexpr (kSplitWGMMAN) {
                 run_split_wgmma_gemm_loop();
             } else if constexpr (BLOCK_K == 256) {
