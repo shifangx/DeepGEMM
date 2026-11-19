@@ -913,8 +913,16 @@ static void apply_sm90_moe_env_override(
 static Sm90MoeLaunchConfig select_mega_moe_sm90(
     const Sm90MoeHeuristicInput& input) {
     const auto hardware_profile = classify_sm90_moe_hardware(input.launch_num_sms);
-    const auto shape_family = classify_sm90_moe_shape(
+    auto shape_family = classify_sm90_moe_shape(
         input.hidden, input.intermediate_hidden);
+    // opt02 experiment: DG_SM90_MOE_FAMILY=compact|wide|generic forces the shape family, so that
+    // a shape outside the tuning tables (hidden 1536) can be run with the tables of a nearby family.
+    if (const char* family = std::getenv("DG_SM90_MOE_FAMILY")) {
+        const std::string name(family);
+        if (name == "compact") shape_family = Sm90MoeShapeFamily::Compact;
+        else if (name == "wide") shape_family = Sm90MoeShapeFamily::Wide;
+        else if (name == "generic") shape_family = Sm90MoeShapeFamily::Generic;
+    }
     const auto load = get_sm90_moe_load(input);
 
     auto generic = make_generic_mega_moe_config_sm90(input);
@@ -944,6 +952,15 @@ static Sm90MoeLaunchConfig select_mega_moe_sm90(
         result = candidate;
     }
     apply_sm90_moe_env_override(input, result);
+    // opt02 experiment: DG_SM90_MOE_BF16_ACCUM=0|1 overrides the packed-BF16 scaled accumulation
+    // (only when both phases support it; an unsupported request is ignored).
+    if (const char* accum = std::getenv("DG_SM90_MOE_BF16_ACCUM")) {
+        const bool want = std::string(accum) == "1";
+        auto forced = result;
+        forced.numerical.bf16_scaled_accum = want;
+        if (is_sm90_moe_launch_config_legal(input, forced, true))
+            result = forced;
+    }
     if (deep_jit::get_env<int>("DG_JIT_DEBUG", 0) or deep_jit::get_env<int>("DG_PRINT_CONFIGS", 0)) {
         const auto key = std::format(
             "Sm90MoeLaunchConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
